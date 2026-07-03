@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# visualize.py outputs (regenerated)
+surfaces.png
+heatmaps.png
+slices.png
+kink_trajectories.png
