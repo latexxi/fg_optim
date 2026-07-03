@@ -4,22 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small numerical-optimization research prototype (two files, no package/build system, not a git repo). It solves
+A small numerical-optimization research prototype: the solver is a plain-import Python package (`kink_opt/`, no build system, no `setup.py`/`pyproject.toml`), plus a standalone `visualize.py`. It solves
 
     max J[f,g] = int_0^1 int_{-1}^1 f_t(x,t) * g_xx(x,t) dx dt
 
-over pairs of time-varying, x-convex, Lipschitz functions `f(x,t)` and `g(x,t)` on `x in [-1,1]`, `t in [0,1]`, subject to `f(+-1,t)=g(+-1,t)=0`, `f(x,1)=0`, `g(x,0)=0`, `f_t>=0`, `g_t<=0`. There is no formal spec beyond the docstring in `kink_opt.py` — that docstring is the source of truth for the math (constraint dictionary, objective derivation, basis definition) and should be read before making changes to the solver.
+over pairs of time-varying, x-convex, Lipschitz functions `f(x,t)` and `g(x,t)` on `x in [-1,1]`, `t in [0,1]`, subject to `f(+-1,t)=g(+-1,t)=0`, `f(x,1)=0`, `g(x,0)=0`, `f_t>=0`, `g_t<=0`. There is no formal spec beyond the module docstring in `kink_opt/__init__.py` — that docstring is the source of truth for the math (constraint dictionary, objective derivation, basis definition) and should be read before making changes to the solver.
 
 ## Files
 
-- `kink_opt.py` — the entire solver: geometry helpers, LP/NLP blocks, analytic gradients, topology moves (add/prune kinks), verification, and a `__main__` driver that runs a sequence of numbered demos ("Run 1" ... "Run 6").
-- `visualize.py` — imports `run`, `conv_eval`, `report` from `kink_opt.py`, runs one optimization, and saves `surfaces.png`, `heatmaps.png`, `slices.png`, `kink_trajectories.png` to the repo root.
+- `kink_opt/__init__.py` — module docstring (source of truth for the math) + re-exports of the public API (so `from kink_opt import run, conv_eval, report` keeps working).
+- `kink_opt/geometry.py` — hat basis (`hat_matrix`, `conv_eval`), weight-LP box bounds (`_wbounds`), the tunable constants `MARGIN`/`GAP`/`PEN_W`.
+- `kink_opt/lp.py` — the convex weight blocks, `lp_weights_f` / `lp_weights_g` (scipy `linprog`, HiGHS).
+- `kink_opt/objective.py` — `total_J`, analytic gradients (`grad_total_J`, `grad_penalty`, `_step_diff_grad`), `penalty`, and the nonconvex position block `optimize_positions`.
+- `kink_opt/verify.py` — `refine_time`, `graded_grid`, `verify_dense`, and the `certify()`/`report()` verification pipeline; also `_ub` (lifetime mask -> LP upper bounds) since both the driver and topology moves need it.
+- `kink_opt/solver.py` — the block-coordinate driver: `_alternate`, `run`, `multistart`.
+- `kink_opt/topology.py` — topology moves (Task B: `add_kink`/`prune`/`grow_topology`), the renormalization warm start (Task D: `spawn_generation`), and the Run 9 generation-gain ladder (`generation_step`/`generation_ladder`).
+- `kink_opt/demos.py` — the narrated `__main__` driver, `main()`, running the numbered demos ("Run 1" ... "Run 9"). Also runnable as `python3 -m kink_opt` via `kink_opt/__main__.py`.
+- `visualize.py` — imports `run`, `conv_eval`, `report` from the `kink_opt` package, runs one optimization, and saves `surfaces.png`, `heatmaps.png`, `slices.png`, `kink_trajectories.png` to the repo root.
 
 ## Commands
 
 ```
-python3 kink_opt.py     # runs the full Run 1-6 demo sequence, prints J at each stage (~2min)
-python3 visualize.py    # runs one optimization and regenerates the four PNGs (also calls plt.show())
+python3 -m kink_opt      # runs the full Run 1-9 demo sequence, prints J at each stage (~2min)
+python3 visualize.py     # runs one optimization and regenerates the four PNGs (also calls plt.show())
 ```
 
 No test suite, linter, or build system is present. Dependencies (numpy, scipy, matplotlib) are assumed already installed in the environment; there is no requirements file.
@@ -83,12 +90,12 @@ The time grid need not be uniform. The pivotal fact: `total_J`, the weight-LPs, 
 
 **Honest null result (Run 8):** on Run 3's gen-0 optimum the warm start does **not** beat a random insertion. It converges faster (2 outers vs ~8) but into a shallower basin (J_certified 2.3251 vs random's 2.3700). Cause is structural, not a bug: Run 3's kinks barely travel, so contracting about the travel end produces a copy nearly **co-located** with its parent, and two hats at one point are redundant in a convex-hat sum (the LP assigns it ~no weight). The null holds across static/travel seeds, sparse/dense bases, wide/narrow windows. Takeaway for anyone continuing this: the Section-5 generation-gain experiment does **not** require the warm start to work — `spawn_generation` is an accelerator, and the load-bearing insertion path is still `add_kink`/`grow_topology` multistart (Run 8's random arm is the current workhorse). See STRATEGY.md Task D + the Section 5 "Premise caveat".
 
-### Tunable constants (top of `kink_opt.py`)
+### Tunable constants (`kink_opt/geometry.py`)
 
 - `MARGIN` — keeps kink positions inside `(-1+MARGIN, 1-MARGIN)`, bounds for the position NLP.
 - `GAP` — minimum spacing enforced between same-family kinks (soft penalty).
 - `PEN_W` — weight on the soft penalty term relative to `-J` in the position NLP objective.
 
-### The `__main__` block
+### `demos.py` (the `__main__` sequence)
 
-Not a test suite — it's a sequence of numbered, narrated demos ("Run 1" through "Run 8") where each run's configuration and print-statement commentary explains what the previous run left on the table and why the next one's hyperparameters were chosen. Runs 1-5 are fixed-K weight/position optimization (Run 5's Kf=6/Kg=5 multistart is the best brute-force feasible frontier); Run 6 is the Task B topology-move demo (`grow_topology` growing Run 3's 3+2 by accepted insertions); Run 7 is the Task C graded-grid demo (Part A reproduces Run 3 at half the time nodes; Part B shows a narrow lifetime window costing far fewer variables graded than uniform); Run 8 is the Task D renormalization-warm-start demo — a deliberately **honest null**: it verifies `spawn_generation`'s insertion is J-neutral, then shows the warm start converging faster but to a worse J than random insertion, and narrates why (no self-similar travel structure at gen 0). When extending this file, follow that pattern (add a new "Run N" with an explanatory header) rather than replacing prior runs, since they double as a record of what's already been tried.
+Not a test suite — it's a sequence of numbered, narrated demos ("Run 1" through "Run 9") where each run's configuration and print-statement commentary explains what the previous run left on the table and why the next one's hyperparameters were chosen. Runs 1-5 are fixed-K weight/position optimization (Run 5's Kf=6/Kg=5 multistart is the best brute-force feasible frontier); Run 6 is the Task B topology-move demo (`grow_topology` growing Run 3's 3+2 by accepted insertions); Run 7 is the Task C graded-grid demo (Part A reproduces Run 3 at half the time nodes; Part B shows a narrow lifetime window costing far fewer variables graded than uniform); Run 8 is the Task D renormalization-warm-start demo — a deliberately **honest null**: it verifies `spawn_generation`'s insertion is J-neutral, then shows the warm start converging faster but to a worse J than random insertion, and narrates why (no self-similar travel structure at gen 0); Run 9 is the Section-5 generation-gain ladder (`generation_ladder`). When extending this file, follow that pattern (add a new "Run N" with an explanatory header) rather than replacing prior runs, since they double as a record of what's already been tried.
