@@ -3,185 +3,184 @@
 Companion to `plans/run9-generation-gain-ladder.md` (strategy). This one is
 implementation-level: exact functions, signatures, file locations, data flow.
 
-## New code, in order
+## Status: IMPLEMENTED, verified, committed (`d91fc20`)
+
+All 6 pieces below were shipped in `kink_opt.py` and Run 9 ran cleanly as
+part of `python3 kink_opt.py` (full driver ~57s including Run 9). The file
+was later split into the `kink_opt/` package (`b7eedf7`); line locations
+below are updated to the post-split files, verified byte-identical output
+across the whole demo suite before/after the split. Two real issues
+surfaced during verification and are recorded here since they change how
+much to trust the numbers, not just how the code is organized:
+
+1. **Regrid resolution-loss bug (found and fixed).** The original plan had
+   `generation_ladder` build the ladder's time grid directly from
+   `graded_grid(...)`. But `graded_grid`'s own uniform background
+   (`coarse_N`) can be *coarser* than the base solution's original grid
+   outside the lifetime windows -- migrating onto it silently lost
+   resolution and made the regrid measurably non-J-neutral (2.309 -> 2.265,
+   a real defect caught by the "regrid must reproduce base J" guard, not
+   discretization noise). Fixed by unioning the graded grid with the base
+   grid's own `t` (`np.union1d`) so the migration is a strict superset,
+   never a coarsening. See step 5 below.
+2. **Budget was too low for feasibility (found and fixed).** The first full
+   run had every generation land `feasible=False` by a tiny margin (~3e-8
+   against the `1e-9` `verify_dense` floor). Diagnosed by rerunning the same
+   candidate at higher `outer`/`pos_iters` and watching the violation
+   collapse to float noise (~1e-15) while `Jc` also improved -- confirming
+   under-convergence, not a real defect. The Run 9 driver call was bumped
+   from `outer=10, pos_iters=30` to `outer=25, pos_iters=60` accordingly.
+
+Two small deviations from the original plan text, both harmless:
+- `_kink_diagnostics`'s output is used per-family as `dict(f=..., g=...)`
+  rather than a plain list -- clearer at the call site, same content.
+- `_seed_grown`'s signature takes `base` as an explicit first argument
+  (`_seed_grown(base, XI2, ETA2, af2, ag2)`) rather than closing over a
+  module-level `G0`, since the ladder calls it once per generation with a
+  different `cur` each time (Run 8's original closure only ever needed one
+  fixed `G0`).
+
+## New code, in order (final line numbers, post kink_opt/ package split)
 
 ### 1. `graded_grid` — extend `fine_sub` to accept per-window density
 
-**Location:** `kink_opt.py`, existing function (~line 439).
+**Location:** `kink_opt/verify.py:54`.
 
-Problem: as w_k halves each generation, a single scalar `fine_sub` makes
-`n_loc = max(2, round(fine_sub * coarse_N * span / (t1-t0)))` shrink toward
-the floor of 2 — violates the "finest lifetime spans >= 8 fine steps" rule
-from STRATEGY.md Section 5.
+`fine_sub` may be a scalar (old behavior, bit-for-bit unchanged) or a list
+the same length as `windows`, giving each window its own density. The
+ladder passes `fine_sub_k = base_fine_sub * (window0 / w_k)` per window so
+the local node count stays roughly flat across generations instead of
+shrinking toward the "finest lifetime spans >= 8 fine steps" floor.
+Verified: scalar path bit-identical to a matching-value list; mismatched
+list length raises `ValueError`; varying the list produces genuinely
+different per-window density; empty-windows path unaffected.
 
-Change: `fine_sub` may be a scalar (old behavior, unchanged) or a list same
-length as `windows`, giving each window its own density. Ladder code passes
-`fine_sub_k = base_fine_sub * (window0 / w_k)` per window so `n_loc` stays
-roughly flat across generations instead of shrinking. Backward compatible —
-scalar path is bit-for-bit identical, so Runs 1-7 stay unchanged (verify with
-existing invariant check before moving on).
+### 2. `_seed_grown` — module function (was a Run 8 closure)
 
-### 2. `_seed_grown` — promote from Run 8's local closure to a module function
+**Location:** `kink_opt/topology.py:43`, near `_insert_column`.
 
-**Location:** new, near `_insert_column` (~line 686) — it's Task B/D
-machinery, not driver code.
-
-Signature: `_seed_grown(base, XI2, ETA2, af2, ag2)`. Currently this logic
-lives inline in the `__main__` Run 8 block (lines ~1004-1013): pad `base["A"]`
-/ `base["B"]` with a zero column for each grown family, then run the
-weight-LP pair (`lp_weights_f` -> `lp_weights_g` -> `lp_weights_f`) to
-bootstrap a feasible, J-unchanged starting point after `_insert_column` /
-`add_kink` grows a family by one column. The ladder calls this every
-generation (Run 8 only needed it once), so it earns a real name instead of a
-closure. Run 8's `__main__` block gets updated to call the promoted function
-(no behavior change, just deduplication).
+`_seed_grown(base, XI2, ETA2, af2, ag2)`: pads `base["B"]` with a zero
+column for any new g-kink, then runs the weight-LP pair
+(`lp_weights_f` -> `lp_weights_g` -> `lp_weights_f`) to bootstrap a
+feasible, J-unchanged starting point after a family grows by one column.
+Run 8's `__main__` block was updated to call this instead of its old local
+closure (mechanical dedupe, confirmed byte-identical Run 8 output).
 
 ### 3. `_kink_diagnostics` — post-optimization measurement helper
 
-**Location:** new, near `_lifetime_window` (~line 700).
+**Location:** `kink_opt/topology.py:70`, near `_lifetime_window`.
 
-Signature: `_kink_diagnostics(r, family, col_idx, parent_idx, tol=1e-8)`.
-Returns `dict(lifetime=(t_on, t_off), extent=(min_x, max_x), jump_mean,
-offset_from_parent)`:
-
-- `t_on, t_off`: first/last time node where `|weight[:, col_idx]| > tol`
-  (the *effective* active window, which may be narrower than the imposed
-  mask — this is exactly the self-similarity test: does the optimizer keep
-  the full imposed window or contract it further on its own).
-- `extent`: min/max of the position trajectory over the active window.
-- `jump_mean`: mean over the active window of `2*w/(1-x**2)` (the "jump"
-  formula from the module docstring), using the family's own weight column.
-- `offset_from_parent`: mean `|position[:, col_idx] - position[:, parent_idx]|`
-  over the active window — tests "riding on the parent path."
-
-This is pure measurement, no solver interaction — keeps STRATEGY.md's
-secondary-measurement list (lifetime/extent, jump size, offset) machine-
-computed rather than eyeballed from printouts.
+`_kink_diagnostics(r, family, col_idx, parent_idx, tol=1e-8)` returns
+`dict(lifetime=(t_on, t_off), extent=(min_x, max_x), jump_mean,
+offset_from_parent)`, computed over the kink's *effective* active window
+(`|weight| > tol`), not its imposed mask -- this is the actual
+self-similarity test (does the optimizer keep the full imposed window or
+contract further on its own). If the LP starves the new kink to zero
+weight everywhere, falls back to reporting over the imposed lifetime mask
+instead of returning NaN, so "the optimizer used none of its allotted
+window" is a visible, meaningful number rather than a crash or a blank.
+Verified standalone against a hand-built toy solution for both the
+active-weight case and the fully-pruned fallback case, and observed firing
+correctly in a real run (a toy 2+2 base where the new kink got starved).
 
 ### 4. `generation_step` — one rung of the ladder
 
-**Location:** new, near `grow_topology` (~line 763) — same family of
-"insert, re-optimize, certify" drivers.
+**Location:** `kink_opt/topology.py:166`.
 
-Signature:
 ```
-generation_step(cur, window, seeds=range(3), dx=0.05,
-                outer=12, pos_iters=40, patience=None, sub=8)
+generation_step(cur, window, seeds=range(3), dx=0.05, outer=12,
+                pos_iters=40, patience=None, sub=8)
 ```
-`window = (t_birth, t_death)`, applied identically to both a new f-kink and a
-new g-kink (STRATEGY: "1 for f, 1 for g"). For each `rng_seed` in `seeds`:
+Inserts one new f-kink and one new g-kink, both alive only on
+`window = (t_birth, t_death)`, as perturbed copies (`add_kink`) of each
+family's current most-active column. For each seed: insert, `_seed_grown`,
+`_alternate`, compute `_kink_diagnostics` on the *pre-prune* candidate
+(tracking the new column by its append-time index, since pruning can shift
+indices and the fully-pruned fallback needs the column still physically
+present), then `prune` + `certify`. Keeps the best *feasible* candidate by
+`Jc`, falling back to the best candidate overall (flagged
+`feasible=False`) if none certify -- an optimizer failure must be visible,
+not silently dropped. Passing `window = (t[0], t[-1])` (full lifetime)
+turns the identical call into the guard arm.
 
-1. Pick each family's current most-active column as parent (`argmax` of
-   `max(|weight|, axis=0)`, same idiom as `grow_topology`/`spawn_generation`).
-2. `add_kink("f", ..., parent_f, t, *window, dx=dx, rng=rng)`, then
-   `add_kink("g", ..., parent_g, t, *window, dx=dx, rng=rng)` chained on the
-   growing XI/ETA/alive_f/alive_g.
-3. `_seed_grown` to bootstrap feasible weights for the two new (zero-weight)
-   columns.
-4. `_alternate(..., outer=outer, pos_iters=pos_iters, patience=patience or
-   outer)` to re-optimize.
-5. `prune` (drops the new kink if the LP starved it — a real possible
-   outcome, not an error).
-6. `certify` for `Jc`.
-
-Keep the best-`Jc` seed; return
-`dict(sol=best_r, Jc=best_Jc, diagnostics=[_kink_diagnostics(...) for each
-new column], spread=[Jc per seed])` — the spread is the "report the spread,
-not just the max" honesty requirement.
-
-Also used for the **guard arm**: called with `window = (t[0], t[-1])`
-(full lifetime) instead of the imposed shrinking window — same function, no
-separate code path, since "windowed vs free" is just a `window` argument.
+Returns `dict(sol, Jc, feasible, diagnostics=dict(f=..., g=...),
+spread=[(seed, Jc, feasible), ...])`.
 
 ### 5. `generation_ladder` — the driver
 
-**Location:** new, near `grow_topology`.
+**Location:** `kink_opt/topology.py:230`, right after `generation_step`.
 
-Signature:
 ```
 generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
                    seeds=range(3), dx=0.05, base_fine_sub=4, coarse_N=8,
                    outer=12, pos_iters=40, sub=8, verbose=True)
 ```
 
-Steps:
-1. `cur = prune(base, 1e-8)`; `J = [certify(cur, sub=sub)["Jc"]]`.
-2. Precompute the full window schedule up front:
-   `w_k = window0 * window_ratio**(k-1)` for `k in 1..n_gen`,
-   `windows_k = (t1 - w_k, t1)` (anchored at the shared travel-path end,
-   matching Run 8's window convention).
-3. Build one graded grid for the *whole* ladder via the extended
-   `graded_grid(windows=[windows_k for all k], coarse_N=coarse_N,
-   fine_sub=[base_fine_sub * window0 / w_k for each k])` — computed once,
-   not regridded per generation, so every generation's certification sees
-   the same node set plus its own refine_time multiplier.
-4. Migrate `cur` onto that grid once: linear-interpolate `A, XI, B, ETA`
-   from `cur["t"]` onto the new `t` (same interpolation `refine_time`
-   already does internally — reuse its `interp` closure or lift it to a
-   shared helper), set `alive_f`/`alive_g` all-True on the new grid (G0 has
-   no windows yet), re-solve the weight LPs once to restore exact
-   feasibility on the new grid, then confirm `certify` reproduces `J[0]`
-   within tolerance (regression guard — regridding must be J-neutral).
-5. For `k in 1..n_gen`:
-   - `windowed = generation_step(cur, windows_k, seeds=seeds, dx=dx,
-     outer=outer, pos_iters=pos_iters, sub=sub)`
-   - `guard = generation_step(cur, (t[0], t[-1]), seeds=seeds, dx=dx,
-     outer=outer, pos_iters=pos_iters, sub=sub)`
-   - `cur = windowed["sol"]` (the ladder always advances on the windowed
-     arm — that's the hypothesis under test; the guard is comparison only,
-     never adopted, so it can't quietly turn into Runs 4-5's unrestricted
-     growth).
-   - append `dict(k=k, w_k=w_k, Jc=windowed["Jc"],
-     dJk=windowed["Jc"] - J[-1], guard_Jc=guard["Jc"],
-     guard_dJk=guard["Jc"] - J[-1], diagnostics=windowed["diagnostics"],
-     spread=windowed["spread"])` to the results list.
-   - `J.append(windowed["Jc"])`.
-6. Return `dict(generations=results, base_Jc=J[0])`.
+1. `cur = prune(base, 1e-8)`; `base_Jc = certify(cur)["Jc"]`.
+2. Precompute the full window schedule: `w_k = window0 * window_ratio**(k-1)`
+   for `k in 1..n_gen`, `windows_k = (t1 - w_k, t1)` (all anchored at the
+   shared right endpoint, so later windows nest inside earlier ones).
+3. `grid = graded_grid(windows, coarse_N=coarse_N, fine_sub=[base_fine_sub *
+   window0/w_k for each k], t0=t0, t1=t1)`, then `t_new =
+   np.union1d(grid, cur["t"])` -- the fix from the Status section above:
+   this guarantees the migration is a strict refinement, never a
+   coarsening, of `base`'s own grid.
+4. Migrate `cur` onto `t_new` via `_interp_to_grid` (lifted out of
+   `refine_time` as a shared helper, `kink_opt/verify.py:30`) for `A, XI, B, ETA`;
+   all-alive masks (no windows yet); re-solve the weight LPs once to
+   restore exact feasibility. Check `certify(cur)["Jc"]` is within 1% of
+   `base_Jc` (a relative bar, not exact equality -- Run 7 already
+   established that changing node count changes the harvest sum's discrete
+   sampling slightly, so an absolute-zero bar would be too strict); raises
+   `RuntimeError` past that, since a silent large mismatch would corrupt
+   every downstream `dJk`.
+5. Loop `k in 1..n_gen`: `windowed = generation_step(cur, windows_k, ...)`,
+   `guard = generation_step(cur, (t0, t1), ...)`, record `dJk =
+   windowed["Jc"] - J`, `guard_dJk = guard["Jc"] - J`, advance
+   `cur = windowed["sol"]` (the guard is comparison-only, never adopted --
+   it can't quietly degrade into Runs 4-5's unrestricted growth).
 
-### 6. `__main__` Run 9 block
+Returns `dict(generations=[dict(k, w_k, window, Jc, dJk, feasible,
+guard_Jc, guard_dJk, guard_feasible, diagnostics, spread), ...], base_Jc)`.
 
-**Location:** end of file, after Run 8 (~line 1050+), following the existing
-narrated-header pattern (see Run 8's header at line 975 for house style).
+### 6. `main()` Run 9 block
 
-- Header explains: Run 8 showed the warm start doesn't beat random at k=0;
-  Run 9 doesn't need the warm start — it runs the actual generation-gain
-  measurement STRATEGY.md Section 5 asks for, using `add_kink` multistart as
-  the (already-working) insertion mechanism, with imposed shrinking windows
-  as the experimental variable.
-- `G0 = prune(r2, 1e-8)` (reuse Run 3's solution, same as Run 8).
-- `res = generation_ladder(G0, n_gen=4, seeds=range(3))`.
-- Print a table: `k, w_k, Jc, dJk, guard_Jc, guard_dJk, spread` — one row per
-  generation — plus the per-generation diagnostics line (lifetime/extent/
-  jump/offset for the two new kinks).
-- Closing interpretation print: is `dJk` roughly flat or decaying, and does
-  it survive comparison to `guard_dJk`.
+**Location:** `kink_opt/demos.py:243` onward, after Run 8.
 
-## Verification before trusting any of this
+Narrated header (Run 8's null doesn't block the measurement; imposed
+windows are the point, not the warm start), `ladder = generation_ladder(G0,
+n_gen=3, window0=0.5, window_ratio=0.5, seeds=range(3), outer=25,
+pos_iters=60, coarse_N=8, base_fine_sub=4, sub=8)`, a per-generation table
+(`k, w_k, Jc, dJk, ok, guard_Jc, guard_dJk, ok`), the diagnostics line for
+each new kink, the per-seed spread, and a closing `dJk` / `guard_dJk`
+sequence print pointing at STRATEGY.md Section 5 for the interpretation
+rule.
 
-- `graded_grid` per-window `fine_sub` list: unit-check against the existing
-  scalar path (`fine_sub=[x]*len(windows)` must equal `fine_sub=x` exactly)
-  before using it in the ladder.
-- Regridding `cur` onto the precomputed ladder grid must reproduce
-  `certify(base)["Jc"]` (within ~1e-6) before generation 1 runs — if it
-  doesn't, the bug is in the migration step, not the ladder logic, and must
-  be fixed first.
-- `generation_step`'s zero-weight insertion must satisfy `total_J` unchanged
-  immediately after `_seed_grown`, same check Run 8 already does for
-  `spawn_generation` — reuse that assertion pattern here.
-- No changes to `total_J`, `grad_total_J`, `penalty`, `grad_penalty`,
-  `_step_diff_grad`, or `optimize_positions` are needed for this feature —
-  if implementation pressure tempts a shortcut there, stop; that's the
-  finite-difference-verified core and out of scope for Run 9.
+## Verification performed
 
-## Suggested build order
+- `graded_grid` list-`fine_sub`: scalar-vs-matching-list bit-identical,
+  mismatched length raises, varying values change density, empty-windows
+  path unaffected.
+- `_interp_to_grid` extraction: `refine_time` regression-checked (coarse
+  node values preserved exactly on the fine grid) before and after the
+  refactor.
+- `_kink_diagnostics`: toy-solution unit test for both branches (active
+  weight, fully-pruned fallback).
+- `generation_step`: smoke-tested standalone on a toy 2+2 run (windowed and
+  guard-arm code paths both exercised); the fully-pruned diagnostics
+  fallback fired correctly in a real (non-contrived) case.
+- `generation_ladder`: regrid-neutrality bug found and fixed (see Status);
+  full driver reproduces Run 1-8 baselines byte-for-byte unchanged
+  (1.916 / 2.220 / 2.309 / 2.420 / 2.544 / 2.411 / 2.2925 / 2.3065 / Run 8
+  null) after every step.
+- No changes were made to `total_J`, `grad_total_J`, `penalty`,
+  `grad_penalty`, `_step_diff_grad`, or `optimize_positions` -- confirmed
+  out of scope for this feature, as planned.
 
-1. `graded_grid` list-`fine_sub` extension + regression check against scalar
-   behavior.
-2. `_seed_grown` promotion (mechanical, dedupe Run 8).
-3. `_kink_diagnostics` (pure function, easy to test standalone against a
-   hand-built toy `r`).
-4. `generation_step` (reuses 2 and existing `add_kink`/`_alternate`/`prune`/
-   `certify`) — test in isolation with `n_gen=1` equivalent before wiring
-   into the ladder.
-5. `generation_ladder` (wires 1-4 together).
-6. Run 9 `__main__` block.
+## Result (see run9-generation-gain-ladder.md for interpretation)
+
+On Run 3's G0 (`J_certified` 2.3089), 3 generations at
+`window0=0.5, window_ratio=0.5`: `dJk = [+0.0546, +0.1048, +0.0045]` against
+`guard_dJk = [+0.0926, +0.1229, +0.0309]` -- guard ahead at every
+generation, `dJk` non-monotone over only 3 points. Not a verdict; see the
+strategy plan for what to run next.

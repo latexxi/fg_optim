@@ -1,6 +1,6 @@
 # Briefing: Hierarchical Kink Optimization for a Coupled PDE Functional
 
-This document is self-contained. You are given one code file, `kink_opt.py`
+This document is self-contained. You are given one code package, `kink_opt/`
 (a working prototype), and this briefing. No other context is needed.
 
 ---
@@ -41,7 +41,7 @@ by kinks instead of grid values:
 
 where hat(x; c) is the tent basis function with hat(+-1) = 0, hat(c) = 1.
 In these coordinates all constraints become simple and EXACT (see the
-docstring of kink_opt.py): convexity = nonnegative weights, Lipschitz = two
+docstring of kink_opt/__init__.py): convexity = nonnegative weights, Lipschitz = two
 linear inequalities per time node, monotonicity = piecewise-linear
 differences checked at the union of kink positions (provably sufficient).
 
@@ -59,7 +59,7 @@ at the locations of g's kinks, weighted by the jump sizes.** Everything
 below follows from this reading.
 
 Time is discretized into N steps; decision variables are the weight and
-position trajectories at the time nodes. The solver in kink_opt.py
+position trajectories at the time nodes. The solver in kink_opt/solver.py
 alternates:
 
   1. LP over f-weights a (positions frozen) — globally optimal, HiGHS
@@ -79,7 +79,7 @@ Baseline results you should be able to reproduce (regression targets):
     Run 2: same, positions free                   -> J_certified ~ 2.219
     Run 3: 3 f-kinks + 2 g-kinks, positions free  -> J_certified ~ 2.297
 
-> **Status (current `kink_opt.py`):** Runs 1-3 reproduce at J_certified =
+> **Status (current `kink_opt/` package):** Runs 1-3 reproduce at J_certified =
 > 1.916 / 2.220 / 2.309 respectively (Run 3 ticked up from 2.297 to 2.309 as
 > a side effect of an unrelated bugfix — `run()`'s position step was not
 > monotone in J and could silently drift below its own best point; it now
@@ -293,7 +293,7 @@ unvalidated at k=0* — which is itself a finding (see Section 5 caveat).
 
 ---
 
-## 5. The experiment that everything serves  [BLOCKED — premise (self-similarity) unvalidated at gen 0; see Task D null]
+## 5. The experiment that everything serves  [RUNNING — machinery done (Run 9), first result INCONCLUSIVE at n_gen=3]
 
 **Protocol (generation-gain measurement):**
 
@@ -360,27 +360,85 @@ parent path (hypothesis: riding on it — "snaking inside snaking").
     seeds (rescaled copy, jittered copy, random) and keep the best; report
     the spread, not just the max.
 
+**Status (Run 9).** The protocol is implemented per the Premise Caveat's
+guard: `generation_step`/`generation_ladder` insert generation k's kinks via
+`add_kink` multistart (the free-search workhorse, not `spawn_generation`)
+under an IMPOSED lifetime window `w_k = window0 * window_ratio**(k-1)`
+anchored at the shared travel-path end, alongside a guard arm (the same call
+with a full-lifetime window, compared but never adopted). One graded time
+grid (Task C) is built up front for the whole ladder, sized so each
+generation's window keeps roughly constant local node density instead of
+collapsing below the >= 8-fine-step floor as it narrows.
+
+First run, from Run 3's G0 (J_certified 2.3089), n_gen=3, window0=0.5,
+window_ratio=0.5, 3 seeds/generation:
+
+    k    w_k      Jc       dJk      guard_Jc  guard_dJk
+    1   0.500   2.3636   +0.0546    2.4015    +0.0926
+    2   0.250   2.4684   +0.1048    2.4864    +0.1229
+    3   0.125   2.4728   +0.0045    2.4993    +0.0309
+
+All feasible (after fixing two real bugs during verification: a regrid step
+that silently lost resolution outside the imposed windows — caught by the
+"regrid must reproduce base J within 1%" guard — and an under-converged
+optimizer budget that landed every generation marginally infeasible until
+`outer`/`pos_iters` were raised; see `plans/run9-code-plan.md` for detail).
+
+**Reading: inconclusive, not a null.** The guard arm beats the windowed arm
+at every generation (same qualitative finding as Run 8's Task D null, now
+shown to persist under a shrinking window too), and dJk itself is
+non-monotone over only 3 points (+0.055, +0.105, +0.004) — too short a
+ladder to distinguish "constant" from "decaying" from "hasn't reached the
+relevant scale yet." This is an honest intermediate result, not evidence
+either way on sup J. Next steps (more generations, more seeds, reading the
+already-collected per-generation diagnostics for a self-similarity signal,
+and possibly a different/deeper base if guard keeps winning) are tracked in
+`plans/run9-generation-gain-ladder.md`.
+
 ## 6. Files
 
-  - kink_opt.py : the prototype. Read its module docstring first; it
-    documents the exact constraint translations and the LP structure.
-    Functions: hat_matrix, conv_eval, _wbounds (geometry + weight-bound
-    builder); lp_weights_f, lp_weights_g (convex blocks, `ub=` for lifetime
-    windows, Task B); total_J, grad_total_J (harvest objective + analytic
-    gradient, Task A); penalty, grad_penalty, _step_diff_grad,
-    optimize_positions (nonconvex block, now gradient-driven, Task A;
-    mask-aware sort, Task B); refine_time (per-interval subdivision so
-    graded grids survive certification, Task C), _refine_mask, verify_dense,
+The prototype was originally one file (`kink_opt.py`); it was split into a
+`kink_opt/` package by dependency layer (verified byte-identical Run 1-9
+output before/after). Read `kink_opt/__init__.py`'s module docstring first;
+it documents the exact constraint translations and the LP structure.
+
+  - kink_opt/geometry.py : hat_matrix, conv_eval, _wbounds (geometry +
+    weight-bound builder); MARGIN, GAP, PEN_W constants.
+  - kink_opt/lp.py : lp_weights_f, lp_weights_g (convex blocks, `ub=` for
+    lifetime windows, Task B).
+  - kink_opt/objective.py : total_J, grad_total_J (harvest objective +
+    analytic gradient, Task A); penalty, grad_penalty, _step_diff_grad,
+    optimize_positions (nonconvex block, gradient-driven, Task A; mask-aware
+    sort, Task B).
+  - kink_opt/verify.py : refine_time (per-interval subdivision so graded
+    grids survive certification, Task C), _refine_mask, verify_dense,
     certify, report (window-aware certification); graded_grid, n_live_nodes
     (non-uniform time grid builder + node-count cost metric, Task C);
-    _alternate (shared mask-aware block alternation); run (driver, accept/
-    reject safeguard on the position step, `t=` to inject a non-uniform grid,
-    Task C); multistart (reruns `run` over several `rng_seed` kink-jitters,
-    parallel across processes, keeps the best); add_kink, _insert_column,
-    prune, grow_topology (topology moves, Task B); _lifetime_window,
-    spawn_generation (renormalization warm start, Task D).
-  - visualize.py : imports run/conv_eval/report from kink_opt.py, plots
-    surfaces/heatmaps/slices/kink-trajectories for one solution. Not part
-    of the task list above.
+    _interp_to_grid (linear-in-time interpolation of weights/positions onto
+    an arbitrary grid, shared by refine_time and the Section 5 ladder's
+    one-off migration); _ub (lifetime mask -> LP upper bounds, shared by
+    solver.py and topology.py).
+  - kink_opt/solver.py : _alternate (shared mask-aware block alternation);
+    run (driver, accept/reject safeguard on the position step, `t=` to
+    inject a non-uniform grid, Task C); multistart (reruns `run` over
+    several `rng_seed` kink-jitters, parallel across processes, keeps the
+    best).
+  - kink_opt/topology.py : add_kink, _insert_column, prune, grow_topology
+    (topology moves, Task B); _lifetime_window, spawn_generation
+    (renormalization warm start, Task D); _seed_grown (feasible-weight
+    bootstrap after a family grows by one column, shared by Task D and the
+    Section 5 ladder); _kink_diagnostics (post-optimization
+    lifetime/extent/jump/offset-from-parent for one kink column, with a
+    fully-pruned fallback); generation_step, generation_ladder (Section 5
+    driver: one windowed + one guard-arm insertion per generation, dJk
+    measurement).
+  - kink_opt/demos.py : the narrated Run 1-9 `main()` (was the `__main__`
+    block); also runnable as `python3 -m kink_opt` via `kink_opt/__main__.py`.
+  - kink_opt/__init__.py : module docstring (source of truth for the math)
+    + re-exports of the public API, so `from kink_opt import run, conv_eval,
+    report` (used by visualize.py) is unaffected by the internal split.
+  - visualize.py : imports run/conv_eval/report from the kink_opt package,
+    plots surfaces/heatmaps/slices/kink-trajectories for one solution. Not
+    part of the task list above.
   - CLAUDE.md : repo-orientation notes for Claude Code sessions (commands,
     architecture summary, the "verify gradients numerically" lesson).
