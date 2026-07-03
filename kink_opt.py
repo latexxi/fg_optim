@@ -49,6 +49,7 @@ Extension points are marked with  # EXT.
 
 import numpy as np
 from scipy.optimize import linprog, minimize
+from concurrent.futures import ProcessPoolExecutor
 
 MARGIN = 0.03      # keep kinks inside (-1+MARGIN, 1-MARGIN)
 GAP = 0.02         # minimal spacing between same-family kinks
@@ -271,10 +272,17 @@ def _step_diff_grad(W, P, chi):
     Plo, Phi = P[:-1], P[1:]
     chi_lo, chi_hi = chi[:, :K], chi[:, K:]
 
-    _, dHll_dx, dHll_dxi = _hat_b_parts(Plo, Plo)   # lo fn at lo's own pts
-    _, dHlh_dx, dHlh_dxi = _hat_b_parts(Phi, Plo)   # lo fn at hi's pts
-    _, dHhl_dx, dHhl_dxi = _hat_b_parts(Plo, Phi)   # hi fn at lo's pts
-    _, dHhh_dx, dHhh_dxi = _hat_b_parts(Phi, Phi)   # hi fn at hi's own pts
+    # lo fn (node=Plo) and hi fn (node=Phi), each queried at BOTH blocks'
+    # points at once (xc matches step_diff's own checkpoint concatenation)
+    # -- elementwise in query point, so this is the same numbers as four
+    # separate K-sized calls, just batched into two 2K-sized ones.
+    xc = np.concatenate([Plo, Phi], axis=1)
+    _, dHlo_dx, dHlo_dxi = _hat_b_parts(xc, Plo)
+    _, dHhi_dx, dHhi_dxi = _hat_b_parts(xc, Phi)
+    dHll_dx, dHlh_dx = dHlo_dx[:, :K], dHlo_dx[:, K:]
+    dHll_dxi, dHlh_dxi = dHlo_dxi[:, :K], dHlo_dxi[:, K:]
+    dHhl_dx, dHhh_dx = dHhi_dx[:, :K], dHhi_dx[:, K:]
+    dHhl_dxi, dHhh_dxi = dHhi_dxi[:, :K], dHhi_dxi[:, K:]
 
     Sx_ll = np.einsum('ki,kqi->kq', Wlo, dHll_dx)
     Sx_hl = np.einsum('ki,kqi->kq', Whi, dHhl_dx)
@@ -465,14 +473,30 @@ def run(N=24, Kf=3, Kg=2, outer=6, seed="travel", pos_iters=40,
     return dict(A=A, XI=XI, B=B, ETA=ETA, t=t, J=Jbest, hist=hist)
 
 
-def multistart(seeds=range(6), **kwargs):
+def _multistart_worker(args):
+    s, kwargs = args
+    return s, run(rng_seed=s, verbose=False, **kwargs)
+
+
+def multistart(seeds=range(6), workers=None, **kwargs):
     """optimize_positions is only a local search (nonconvex NLP block), so the
     outcome depends on the initial kink jitter. Run the full pipeline from
     several rng_seed jitters and keep the globally-best feasible result.
-    kwargs are forwarded to run() (N, Kf, Kg, outer, seed, pos_iters, ...)."""
+    kwargs are forwarded to run() (N, Kf, Kg, outer, seed, pos_iters, ...).
+    Each seed's run() is fully independent, so seeds are farmed out across
+    processes (ProcessPoolExecutor); pass workers=1 to force serial (e.g. for
+    debugging). Results are still reduced in seed order so ties break the
+    same way as the serial version."""
+    seeds = list(seeds)
+    if workers == 1:
+        results = {s: run(rng_seed=s, verbose=False, **kwargs) for s in seeds}
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            results = dict(ex.map(_multistart_worker,
+                                   [(s, kwargs) for s in seeds]))
     best = None
     for s in seeds:
-        r = run(rng_seed=s, verbose=False, **kwargs)
+        r = results[s]
         if best is None or r["J"] > best["J"]:
             best = r
             best["rng_seed"] = s
