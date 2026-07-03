@@ -219,7 +219,7 @@ that raises J_certified.
 > J-maximization more DOF wins; deliberately restricting lifetimes is Task
 > D's job). Driver "Run 6" narrates this.
 
-### Task C — Per-kink adaptive time nodes  [NOT STARTED]
+### Task C — Per-kink adaptive time nodes  [DONE (graded-grid route)]
 
 Fine-generation kinks live fast and short: a kink alive on a window of
 length 0.05 needs dense time nodes there and none elsewhere. Uniform global
@@ -229,6 +229,31 @@ and constraint checks must then be assembled per-interval on the union of
 the relevant node sets.
 Acceptance: reproduce Run 3's J_certified within 1% using <= half the total
 time-node count.
+
+> **Status: implemented (global graded-grid route, the second option above).**
+> The key enabling fact: `total_J`, the weight-LPs, and the monotonicity
+> checks never read node SPACING -- the `dt` cancels analytically in the
+> harvest sum -- so an arbitrary NON-uniform time grid is transparent to
+> them. Only seeding and certification consult `t`, and both handle
+> non-uniform grids. So the whole graded-grid capability is: `run(..., t=)`
+> to inject any node set; `graded_grid(windows, coarse_N, fine_sub)` to build
+> a coarse background + per-window refinement; `refine_time` generalized to
+> subdivide EACH interval (so grading survives certification -- on a uniform
+> grid this is bit-for-bit the old behaviour, Runs 1-6 unchanged); and
+> `n_live_nodes` as the cost metric.
+> Acceptance results (Run 7): Run 3 (17 nodes, 85 live, J_certified 2.309)
+> reproduces at 8 nodes / 40 live vars (47% of baseline) J_certified 2.2925
+> via multistart -- within 1% at under half the nodes. Note: all-alive Run 3
+> has no short lifetimes, so a graded grid is provably no better than uniform
+> there (identical optima) -- the win is purely the halved count. Grading's
+> real leverage is scale separation: Run 7 Part B resolves a width-0.10
+> lifetime window to 6 local steps with a graded grid at 92 live vars
+> (J_certified 2.3065, within 1% of baseline) vs 312 live vars for a uniform
+> grid at the same local resolution (3.4x fewer, and the ratio grows as the
+> window narrows). NOT the true per-kink-node-set route: kinks still share
+> one global (graded) grid, dead nodes pinned to zero weight via Task B's
+> masks; that is sufficient for the generation experiment and far less
+> invasive than rewriting the LP/harvest assembly per-kink.
 
 ### Task D — The renormalization warm start  [NOT STARTED]
 
@@ -244,7 +269,7 @@ given J) than inserting randomly perturbed kinks.
 
 ---
 
-## 5. The experiment that everything serves  [NOT STARTED — Task B done, blocked on Task D]
+## 5. The experiment that everything serves  [NOT STARTED — Tasks B, C done, blocked on Task D]
 
 **Protocol (generation-gain measurement):**
 
@@ -291,12 +316,15 @@ parent path (hypothesis: riding on it — "snaking inside snaking").
     windows, Task B); total_J, grad_total_J (harvest objective + analytic
     gradient, Task A); penalty, grad_penalty, _step_diff_grad,
     optimize_positions (nonconvex block, now gradient-driven, Task A;
-    mask-aware sort, Task B); refine_time, _refine_mask, verify_dense,
-    certify, report (window-aware certification); _alternate (shared
-    mask-aware block alternation); run (driver, accept/reject safeguard on
-    the position step); multistart (reruns `run` over several `rng_seed`
-    kink-jitters, parallel across processes, keeps the best); add_kink,
-    prune, grow_topology (topology moves, Task B).
+    mask-aware sort, Task B); refine_time (per-interval subdivision so
+    graded grids survive certification, Task C), _refine_mask, verify_dense,
+    certify, report (window-aware certification); graded_grid, n_live_nodes
+    (non-uniform time grid builder + node-count cost metric, Task C);
+    _alternate (shared mask-aware block alternation); run (driver, accept/
+    reject safeguard on the position step, `t=` to inject a non-uniform grid,
+    Task C); multistart (reruns `run` over several `rng_seed` kink-jitters,
+    parallel across processes, keeps the best); add_kink, prune,
+    grow_topology (topology moves, Task B).
   - visualize.py : imports run/conv_eval/report from kink_opt.py, plots
     surfaces/heatmaps/slices/kink-trajectories for one solution. Not part
     of the task list above.

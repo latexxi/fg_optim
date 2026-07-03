@@ -404,8 +404,17 @@ def refine_time(A, XI, B, ETA, t, sub=8):
     """Linear-in-time interpolation of weights AND positions onto a finer
     time grid. This is the continuous-time meaning of the discrete solution;
     evaluating J on the fine grid exposes any exploitation of the coarse
-    midpoint quadrature (kinks whipsawing inside one step)."""
-    tf = np.linspace(t[0], t[-1], (len(t) - 1) * sub + 1)
+    midpoint quadrature (kinks whipsawing inside one step).
+
+    The fine grid subdivides EACH coarse interval into `sub` pieces, so a
+    non-uniform (graded, Task C) grid keeps its grading -- a dense lifetime
+    window stays dense after refinement instead of being flattened to a
+    global uniform spacing (which would under-resolve short windows and so
+    misreport J).  On a uniform grid this is identical to the old global
+    linspace (bit-for-bit, so Runs 1-6 certify unchanged)."""
+    t = np.asarray(t, float)
+    segs = [np.linspace(t[i], t[i + 1], sub + 1)[:-1] for i in range(len(t) - 1)]
+    tf = np.concatenate(segs + [t[-1:]])
     def interp(M):
         return np.column_stack([np.interp(tf, t, M[:, j])
                                 for j in range(M.shape[1])])
@@ -425,6 +434,49 @@ def _refine_mask(alive, t, tf):
             continue
         out[:, j] = (tf >= t[idx[0]] - 1e-12) & (tf <= t[idx[-1]] + 1e-12)
     return out
+
+
+def graded_grid(windows, coarse_N=8, fine_sub=4, t0=0.0, t1=1.0):
+    """Build a global NON-uniform time grid (Task C): a coarse background of
+    `coarse_N` uniform intervals over [t0, t1], with each lifetime window
+    [tb, td] additionally subdivided `fine_sub` times denser.  Fine-generation
+    kinks live fast and short, so uniform global grids would have to be dense
+    EVERYWHERE to resolve the shortest window (~1/w_min nodes across the whole
+    span); grading puts the nodes only where a kink is actually alive, so the
+    total node count grows with the number of generations, not with 1/w_min.
+
+    `windows` is a list of (t_birth, t_death).  The returned grid is sorted and
+    de-duplicated, always contains the coarse nodes (so coarse-scale structure
+    is representable) and both endpoints.  Passing windows=[] (or windows that
+    already span [t0,t1]) reproduces a plain uniform grid, so this is a strict
+    superset of run()'s default grid."""
+    nodes = [np.linspace(t0, t1, coarse_N + 1)]
+    for (tb, td) in windows:
+        tb, td = max(tb, t0), min(td, t1)
+        if td <= tb:
+            continue
+        # local resolution: match the coarse step inside the window, then
+        # refine it fine_sub x denser (at least 2 sub-intervals per window).
+        span = td - tb
+        n_loc = max(2, int(round(fine_sub * coarse_N * span / (t1 - t0))))
+        nodes.append(np.linspace(tb, td, n_loc + 1))
+    t = np.unique(np.concatenate(nodes))
+    # merge nodes closer than a tiny fraction of the coarse step (numerical
+    # duplicates from window edges landing near coarse nodes)
+    tol = 1e-9 * (t1 - t0)
+    keep = np.concatenate([[True], np.diff(t) > tol])
+    return t[keep]
+
+
+def n_live_nodes(r):
+    """Total count of LIVE (kink, time-node) decision variables in a solution
+    -- the Task C cost metric.  A windowed kink only counts the nodes inside
+    its lifetime; an all-alive kink counts every node.  For a uniform all-alive
+    solution this is just (Kf+Kg)*Np1."""
+    af, ag = r.get("alive_f"), r.get("alive_g")
+    nf = int(af.sum()) if af is not None else r["XI"].shape[0] * r["XI"].shape[1]
+    ng = int(ag.sum()) if ag is not None else r["ETA"].shape[0] * r["ETA"].shape[1]
+    return nf + ng
 
 
 def verify_dense(A, XI, B, ETA, t, nx=1601, tol=2e-2):
@@ -515,8 +567,14 @@ def _alternate(A, XI, B, ETA, t, alive_f, alive_g, outer=6, pos_iters=40,
 
 
 def run(N=24, Kf=3, Kg=2, outer=6, seed="travel", pos_iters=40,
-        optimize_pos=True, verbose=True, patience=3, rng_seed=0):
-    t = np.linspace(0.0, 1.0, N + 1)
+        optimize_pos=True, verbose=True, patience=3, rng_seed=0, t=None):
+    # `t` overrides the uniform grid with an arbitrary (e.g. graded, Task C)
+    # non-uniform node set; N is then inferred.  total_J / the weight-LPs /
+    # monotonicity checks never read node SPACING (dt cancels in the harvest
+    # sum), so a non-uniform grid is transparent to them -- only seeding and
+    # certification (refine_time) consult t, and both handle non-uniform t.
+    t = np.linspace(0.0, 1.0, N + 1) if t is None else np.asarray(t, float)
+    N = len(t) - 1
     rng = np.random.default_rng(rng_seed)
 
     if seed == "static":
@@ -796,6 +854,75 @@ if __name__ == "__main__":
     grown = grow_topology(r2, n_gen=2, cand_seeds=range(2), outer=20,
                           pos_iters=40, patience=5)
     report("grown topo", grown)
+
+    print()
+    print("=" * 70)
+    print("Run 7 (Task C): graded (non-uniform) time grid.")
+    print("  total_J / the weight-LPs / the monotonicity checks never read")
+    print("  node SPACING (dt cancels in the harvest sum), so an arbitrary")
+    print("  non-uniform grid is transparent to them -- only seeding and the")
+    print("  certification refinement consult t. That lets us spend time")
+    print("  nodes where kinks actually live instead of a uniform global grid.")
+    print("  Part A -- reproduce Run 3 within 1% at HALF the time nodes.")
+    print("  Part B -- a narrow lifetime window costs O(1/w) nodes on a")
+    print("            uniform grid but O(1) with grading: the variable-count")
+    print("            saving Task C targets (fine generations live fast/short).")
+    print("=" * 70)
+
+    baseJ = certify(r2)["Jc"]                       # Run 3: 17 nodes, all-alive
+    base_live = n_live_nodes(r2)
+    bar = 0.99 * baseJ
+    print(f"  Run 3 baseline: {r2['t'].size} nodes, {base_live} live vars, "
+          f"J_certified = {baseJ:.4f}   (1% bar = {bar:.4f})")
+
+    # Part A: half the nodes. All-alive Run 3 has no short lifetimes, so a
+    # graded grid can't beat a uniform one here (verified: identical optima)
+    # -- the win is purely the halved node count. Multistart because the
+    # coarse-grid position NLP is nonconvex.
+    t_half = np.linspace(0.0, 1.0, 8)               # 8 nodes vs 17
+    bestJ, bestS = -np.inf, None
+    for s in range(8):
+        rh = run(Kf=3, Kg=2, outer=40, seed="static", pos_iters=60,
+                 patience=6, verbose=False, rng_seed=s, t=t_half)
+        ch = certify(rh)
+        if ch["rep"]["ALL CONSTRAINTS OK"] and ch["Jc"] > bestJ:
+            bestJ, bestS, best_rh = ch["Jc"], s, rh
+    print(f"  Part A: {t_half.size} nodes, {n_live_nodes(best_rh)} live vars "
+          f"({100*n_live_nodes(best_rh)//base_live}% of baseline), "
+          f"J_certified = {bestJ:.4f} (seed {bestS})   "
+          f"-> {'PASS' if bestJ >= bar else 'FAIL'} (within 1% at half nodes)")
+
+    # Part B: a fine g-kink alive only on a narrow window W. Resolve W to 6
+    # local steps two ways and count live decision variables.
+    W = (0.45, 0.55)                                # width 0.10
+    tg = graded_grid([W], coarse_N=10, fine_sub=6)  # coarse bg + dense window
+    rg = prune(run(Kf=3, Kg=2, outer=20, seed="static", pos_iters=40,
+                   patience=5, verbose=False, t=tg), 1e-8)
+    rngB = np.random.default_rng(0)
+    parent = int(np.abs(rg["B"]).max(axis=0).argmax())
+    XI2, ETA2, af2, ag2 = add_kink("g", rg["XI"], rg["ETA"], rg["alive_f"],
+                                   rg["alive_g"], parent, tg, W[0], W[1],
+                                   dx=0.03, rng=rngB)
+    A0 = rg["A"]
+    B0 = lp_weights_g(A0, XI2, ETA2, ub=_ub(ag2))
+    A0 = lp_weights_f(XI2, B0, ETA2, ub=_ub(af2))
+    gcand = prune(_alternate(A0, XI2, B0, ETA2, tg, af2, ag2, outer=20,
+                             pos_iters=40, optimize_pos=True, verbose=False,
+                             patience=5), 1e-8)
+    cg = certify(gcand)
+    win_steps = int(((tg >= W[0] - 1e-9) & (tg <= W[1] + 1e-9)).sum()) - 1
+    # uniform grid giving W the SAME 6 local steps needs step = |W|/6 over the
+    # whole span -> ~1/step intervals everywhere; count its live vars for the
+    # same 5 all-alive background kinks + the windowed kink.
+    N_unif = int(round((1.0 - 0.0) / ((W[1] - W[0]) / win_steps)))
+    live_unif = 5 * (N_unif + 1) + (win_steps + 1)
+    print(f"  Part B: window {W} resolved to {win_steps} local steps")
+    print(f"    graded : {tg.size:2d} nodes, {n_live_nodes(gcand):3d} live vars, "
+          f"J_certified = {cg['Jc']:.4f}  ok = {cg['rep']['ALL CONSTRAINTS OK']}"
+          f"  (within 1% of baseline: {cg['Jc'] >= bar})")
+    print(f"    uniform: {N_unif + 1:2d} nodes, {live_unif:3d} live vars for the "
+          f"SAME local resolution ({live_unif / n_live_nodes(gcand):.1f}x more "
+          f"variables; the win grows as the window narrows)")
 
     # EXT: adaptive per-kink time nodes (fine generations live fast & short)
     # EXT: warm-start next generation from a rescaled copy of this solution
