@@ -415,10 +415,17 @@ def refine_time(A, XI, B, ETA, t, sub=8):
     t = np.asarray(t, float)
     segs = [np.linspace(t[i], t[i + 1], sub + 1)[:-1] for i in range(len(t) - 1)]
     tf = np.concatenate(segs + [t[-1:]])
-    def interp(M):
-        return np.column_stack([np.interp(tf, t, M[:, j])
-                                for j in range(M.shape[1])])
-    return interp(A), interp(XI), interp(B), interp(ETA), tf
+    return (_interp_to_grid(A, t, tf), _interp_to_grid(XI, t, tf),
+            _interp_to_grid(B, t, tf), _interp_to_grid(ETA, t, tf), tf)
+
+
+def _interp_to_grid(M, t, tnew):
+    """Linear-in-time interpolation of each column of M (Np1, K) from grid `t`
+    onto `tnew`. Shared by `refine_time` (uniform sub-refinement) and the
+    Run 9 `generation_ladder` (one-off migration onto a precomputed graded
+    grid)."""
+    return np.column_stack([np.interp(tnew, t, M[:, j])
+                            for j in range(M.shape[1])])
 
 
 def _refine_mask(alive, t, tf):
@@ -445,20 +452,31 @@ def graded_grid(windows, coarse_N=8, fine_sub=4, t0=0.0, t1=1.0):
     span); grading puts the nodes only where a kink is actually alive, so the
     total node count grows with the number of generations, not with 1/w_min.
 
-    `windows` is a list of (t_birth, t_death).  The returned grid is sorted and
-    de-duplicated, always contains the coarse nodes (so coarse-scale structure
-    is representable) and both endpoints.  Passing windows=[] (or windows that
-    already span [t0,t1]) reproduces a plain uniform grid, so this is a strict
-    superset of run()'s default grid."""
+    `windows` is a list of (t_birth, t_death). `fine_sub` is either a scalar
+    (applied to every window, the original behaviour) or a sequence of the
+    same length as `windows` giving each window its own density -- needed by
+    the Run 9 generation ladder, where later (narrower) windows need a larger
+    fine_sub just to keep their local node count from shrinking below the
+    "finest lifetime spans >= 8 fine steps" floor. A scalar reproduces the
+    exact old behaviour (`fine_sub=[x]*len(windows)` == `fine_sub=x`).
+
+    The returned grid is sorted and de-duplicated, always contains the coarse
+    nodes (so coarse-scale structure is representable) and both endpoints.
+    Passing windows=[] (or windows that already span [t0,t1]) reproduces a
+    plain uniform grid, so this is a strict superset of run()'s default grid."""
+    fine_subs = (list(fine_sub) if hasattr(fine_sub, "__len__")
+                 else [fine_sub] * len(windows))
+    if len(fine_subs) != len(windows):
+        raise ValueError("fine_sub list must match len(windows)")
     nodes = [np.linspace(t0, t1, coarse_N + 1)]
-    for (tb, td) in windows:
+    for (tb, td), fs in zip(windows, fine_subs):
         tb, td = max(tb, t0), min(td, t1)
         if td <= tb:
             continue
         # local resolution: match the coarse step inside the window, then
         # refine it fine_sub x denser (at least 2 sub-intervals per window).
         span = td - tb
-        n_loc = max(2, int(round(fine_sub * coarse_N * span / (t1 - t0))))
+        n_loc = max(2, int(round(fs * coarse_N * span / (t1 - t0))))
         nodes.append(np.linspace(tb, td, n_loc + 1))
     t = np.unique(np.concatenate(nodes))
     # merge nodes closer than a tiny fraction of the coarse step (numerical
@@ -697,6 +715,112 @@ def _insert_column(family, XI, ETA, alive_f, alive_g, col, win):
     raise ValueError("family must be 'f' or 'g'")
 
 
+def _seed_grown(base, XI2, ETA2, af2, ag2):
+    """Bootstrap feasible weights for a family grown by one column (via
+    add_kink / _insert_column / spawn_generation), from a converged solution
+    `base` whose XI/ETA the grown XI2/ETA2 extend.  The new column carries
+    ZERO weight at insertion (by construction of the callers above), so this
+    is J-neutral -- it only restores exact LP feasibility on the grown shape,
+    it does not change the objective.  `base["B"]` is padded with a zero
+    column for any new g-kink so the first LP sees matching (Kg+1) shapes
+    (no such padding is needed for A: it is solved fresh by the LP, not
+    warm-started, since HiGHS finds the exact optimum in one call)."""
+    B0 = np.zeros((base["t"].size, ETA2.shape[1]))
+    B0[:, :base["B"].shape[1]] = base["B"]
+    A0 = lp_weights_f(XI2, B0, ETA2, ub=_ub(af2))
+    B0 = lp_weights_g(A0, XI2, ETA2, ub=_ub(ag2))
+    A0 = lp_weights_f(XI2, B0, ETA2, ub=_ub(af2))
+    return A0, B0
+
+
+def _lifetime_window(mask_col, t):
+    """[t_birth, t_death] of a boolean lifetime column: the times of its first
+    and last alive node.  All-dead (shouldn't happen) falls back to [t0, t1]."""
+    idx = np.nonzero(mask_col)[0]
+    if idx.size == 0:
+        return t[0], t[-1]
+    return t[idx[0]], t[idx[-1]]
+
+
+def _kink_diagnostics(r, family, col_idx, parent_idx, tol=1e-8):
+    """Post-optimization measurements for one kink column, used by the Run 9
+    generation ladder to test STRATEGY.md's self-similarity hypotheses
+    directly rather than by eyeballing printouts.  `family` is "f" or "g";
+    `col_idx` the new kink's column, `parent_idx` the kink it was seeded from
+    (perturbed copy, add_kink) or contracted from (spawn_generation).
+
+    Returns dict with:
+      lifetime  -- (t_on, t_off): first/last time node where |weight| > tol.
+                   This is the EFFECTIVE active window, which may be narrower
+                   than any imposed lifetime mask -- the self-similarity test
+                   is whether the optimizer contracts it further on its own.
+      extent    -- (min_x, max_x) of the position trajectory over that window.
+      jump_mean -- mean over the active window of 2*w/(1-x**2), the "jump"
+                   formula from the module docstring (same formula for f and
+                   g: both are hat-sum representations with identical
+                   curvature/jump algebra, only g's jump enters the harvest
+                   sum as g_xx).
+      offset_from_parent -- mean |x_new - x_parent| over the active window
+                   (tests "riding on the parent path").
+    A column that is entirely zero-weight (fully pruned away, i.e. the LP
+    gave the new kink nothing at every node) falls back to reporting over its
+    imposed lifetime mask instead of an empty active window, so the numbers
+    stay meaningful ("it used none of its allotted window") rather than NaN.
+    """
+    W = r["A"] if family == "f" else r["B"]
+    P = r["XI"] if family == "f" else r["ETA"]
+    mask = r.get("alive_f") if family == "f" else r.get("alive_g")
+    t = r["t"]
+    w, p, p_parent = W[:, col_idx], P[:, col_idx], P[:, parent_idx]
+    active = np.abs(w) > tol
+    if not active.any():
+        active = mask[:, col_idx] if mask is not None else np.ones_like(w, dtype=bool)
+    lifetime = _lifetime_window(active, t)
+    extent = (float(p[active].min()), float(p[active].max())) if active.any() else (t[0], t[-1])
+    jump = 2.0 * np.abs(w) / (1.0 - p**2)
+    jump_mean = float(jump[active].mean()) if active.any() else 0.0
+    offset_mean = float(np.abs(p - p_parent)[active].mean()) if active.any() else 0.0
+    return dict(lifetime=lifetime, extent=extent, jump_mean=jump_mean,
+                offset_from_parent=offset_mean)
+
+
+def spawn_generation(sol, scale_t=0.5, scale_x=0.5, families=("f", "g"),
+                     rng=None):
+    """Task D -- the renormalization warm start.  If the hierarchy is
+    self-similar, generation k+1 is an affinely-rescaled copy of generation k:
+    shorter lifetime, narrower spatial extent, riding on top of generation k's
+    path.  For each requested family, take the current finest carrier (its most
+    active kink), contract that trajectory SPATIALLY by `scale_x` about the end
+    of its travel path (p_end), and TEMPORALLY to a window of length
+    `scale_t` x its lifetime placed at that end.  The contracted copy is
+    inserted at ZERO weight via the Task B `_insert_column` machinery -- so J
+    and feasibility are unchanged at insertion -- and the caller re-optimizes.
+    Unlike a randomly-perturbed insertion (add_kink), this seeds the new kink
+    already riding the parent path at a fraction of its extent, which is a much
+    better basin for the position NLP (see Run 8).
+    Returns (XI, ETA, alive_f, alive_g) with one new column per family."""
+    XI, ETA = sol["XI"].copy(), sol["ETA"].copy()
+    af, ag = sol["alive_f"].copy(), sol["alive_g"].copy()
+    t = sol["t"]
+    for family in families:
+        W = sol["A"] if family == "f" else sol["B"]
+        cols = sol["XI"] if family == "f" else sol["ETA"]
+        mask = sol["alive_f"] if family == "f" else sol["alive_g"]
+        parent = int(np.abs(W).max(axis=0).argmax())    # finest = most active
+        p = cols[:, parent]
+        alive_idx = np.nonzero(mask[:, parent])[0]
+        tb, td = _lifetime_window(mask[:, parent], t)
+        span = scale_t * (td - tb)
+        wb, wd = td - span, td                           # window at travel end
+        win = (t >= wb - 1e-12) & (t <= wd + 1e-12)
+        p_end = p[alive_idx[-1]] if alive_idx.size else p[-1]
+        col = p_end + scale_x * (p - p_end)              # contract about p_end
+        if rng is not None:
+            col = col + 0.01 * scale_x * rng.standard_normal(col.shape)
+        XI, ETA, af, ag = _insert_column(family, XI, ETA, af, ag, col, win)
+    return XI, ETA, af, ag
+
+
 def prune(r, tol=1e-8):
     """Drop kinks whose |weight| stays below `tol` at every time node (dead
     trajectories the LP never used).  Keeps at least one kink per family."""
@@ -712,6 +836,174 @@ def prune(r, tol=1e-8):
     out["A"], out["XI"], out["alive_f"] = A[:, kf], XI[:, kf], af[:, kf]
     out["B"], out["ETA"], out["alive_g"] = B[:, kg], ETA[:, kg], ag[:, kg]
     return out
+
+
+def generation_step(cur, window, seeds=range(3), dx=0.05, outer=12,
+                    pos_iters=40, patience=None, sub=8):
+    """One rung of the Run 9 generation-gain ladder (STRATEGY.md Section 5):
+    insert ONE new f-kink and ONE new g-kink, both alive only on `window` =
+    (t_birth, t_death), as perturbed copies of the current most-active kink
+    of each family (`add_kink`, Task B machinery -- zero-weight at insertion,
+    so J is unchanged before re-optimization). Tried over several `seeds`
+    (multistart on the insertion jitter, since `_alternate`'s position block
+    is only a local search); the best FEASIBLE candidate by J_certified is
+    kept (falls back to the best candidate overall, flagged `feasible=False`,
+    if none certify -- an optimizer failure must be visible, not silently
+    dropped).
+
+    Passing `window = (t[0], t[-1])` (full lifetime) turns this into the
+    "guard arm" (a free, unrestricted insertion) -- same code path, since
+    windowed-vs-free is just this one argument.
+
+    Column identity: the new kink is appended as the LAST column of its
+    family (`cur["XI"].shape[1]` / `cur["ETA"].shape[1]` before insertion).
+    This index is tracked into the post-alternation candidate BEFORE pruning
+    (pruning can shift indices, and if the new kink itself dies, the
+    diagnostics still need its column present with all-zero weight -- see
+    `_kink_diagnostics`'s fallback). This relies on the same no-crossing
+    column-identity assumption `optimize_positions`'s mask-permutation already
+    depends on elsewhere in this file.
+
+    Returns dict(sol, Jc, feasible, diagnostics=dict(f=..., g=...),
+    spread=[(seed, Jc, feasible), ...]) -- `spread` is the per-seed honesty
+    record (STRATEGY.md: "report the spread, not just the max")."""
+    t = cur["t"]
+    tb, td = window
+    pf = int(np.abs(cur["A"]).max(axis=0).argmax())    # most active f-kink
+    pg = int(np.abs(cur["B"]).max(axis=0).argmax())    # most active g-kink
+    new_f_idx = cur["XI"].shape[1]                     # append position
+    new_g_idx = cur["ETA"].shape[1]
+
+    results = []
+    for s in seeds:
+        rng = np.random.default_rng(s)
+        XI2, ETA2, af2, ag2 = add_kink(
+            "f", cur["XI"], cur["ETA"], cur["alive_f"], cur["alive_g"],
+            pf, t, tb, td, dx=dx, rng=rng)
+        XI2, ETA2, af2, ag2 = add_kink(
+            "g", XI2, ETA2, af2, ag2, pg, t, tb, td, dx=dx, rng=rng)
+        A0, B0 = _seed_grown(cur, XI2, ETA2, af2, ag2)
+        cand = _alternate(A0, XI2, B0, ETA2, t, af2, ag2, outer=outer,
+                          pos_iters=pos_iters, optimize_pos=True,
+                          verbose=False, patience=patience or outer)
+        diag_f = _kink_diagnostics(cand, "f", new_f_idx, pf)
+        diag_g = _kink_diagnostics(cand, "g", new_g_idx, pg)
+        pruned = prune(cand, tol=1e-8)
+        c = certify(pruned, sub=sub)
+        feasible = bool(c["rep"]["ALL CONSTRAINTS OK"])
+        results.append(dict(seed=s, sol=pruned, Jc=c["Jc"], feasible=feasible,
+                            diagnostics=dict(f=diag_f, g=diag_g)))
+
+    feasible_results = [r for r in results if r["feasible"]]
+    pool = feasible_results if feasible_results else results
+    best = max(pool, key=lambda r: r["Jc"])
+    return dict(sol=best["sol"], Jc=best["Jc"], feasible=best["feasible"],
+                diagnostics=best["diagnostics"],
+                spread=[(r["seed"], r["Jc"], r["feasible"]) for r in results])
+
+
+def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
+                      seeds=range(3), dx=0.05, base_fine_sub=4, coarse_N=8,
+                      outer=12, pos_iters=40, sub=8, verbose=True):
+    """Run 9 driver -- the STRATEGY.md Section 5 generation-gain measurement.
+    Starting from a converged `base` solution (Run 3's G0 in the driver
+    below), births one windowed generation at a time via `generation_step`
+    and tracks dJk = Jk - J_{k-1}. Roughly constant dJk over several
+    generations supports the log-growth conjecture (sup J = +infinity);
+    decaying dJk means J is bounded and the mesh's ln(Nx) growth was a
+    discretization artifact.
+
+    Window schedule: w_k = window0 * window_ratio**(k-1), anchored at the
+    shared right endpoint (the travel-path end all generations ride toward),
+    so window_k = (t1 - w_k, t1). This is precomputed for ALL n_gen
+    generations up front (not regridded per generation) so a single graded
+    time grid (Task C) serves the whole ladder: `graded_grid` gets a
+    per-window `fine_sub` scaled as `base_fine_sub * window0/w_k`, which
+    counteracts the shrinking window width so each generation's local node
+    count stays roughly flat instead of collapsing below the "finest
+    lifetime spans >= 8 fine steps" honesty floor (STRATEGY.md Section 5) --
+    certify()'s own further sub-refinement (`sub`) multiplies on top of that.
+
+    `base` is migrated onto the precomputed grid ONCE (linear interpolation
+    of weights/positions via `_interp_to_grid`, all-alive masks since it
+    carries no windows yet, then an exact weight-LP re-solve to restore
+    feasibility -- the same repair `certify` already relies on). This
+    migration should be near J-neutral (some drift is expected -- a different
+    node count samples the harvest sum differently, same reason Run 7 uses a
+    1% bar rather than exact equality); it is checked against `certify(base)`
+    before generation 1 runs and raises past a 1% relative gap, since a
+    silent large mismatch there would corrupt every downstream dJk.
+
+    Each generation additionally runs a "guard arm" -- the same
+    `generation_step` call with a full-lifetime window instead of the
+    imposed one -- so a constant windowed dJk can be checked against free
+    (non-hierarchical) insertion, per STRATEGY.md's non-negotiable guard.
+    The ladder always advances on the WINDOWED arm; the guard is comparison
+    only and is never adopted, so this can't quietly degrade into the
+    unrestricted growth of Runs 4-5.
+
+    Returns dict(generations=[dict(k, w_k, window, Jc, dJk, feasible,
+    guard_Jc, guard_dJk, guard_feasible, diagnostics, spread), ...],
+    base_Jc)."""
+    cur = prune(base, tol=1e-8)
+    base_Jc = certify(cur, sub=sub)["Jc"]
+
+    t0, t1 = cur["t"][0], cur["t"][-1]
+    ws = [window0 * window_ratio**(k - 1) for k in range(1, n_gen + 1)]
+    windows = [(t1 - w, t1) for w in ws]
+    fine_subs = [base_fine_sub * window0 / w for w in ws]
+    grid = graded_grid(windows, coarse_N=coarse_N, fine_sub=fine_subs,
+                       t0=t0, t1=t1)
+    # A regridding must be a strict REFINEMENT of `base`'s own nodes, never a
+    # coarsening -- graded_grid's own uniform background (`coarse_N`) may be
+    # coarser than base's original grid outside the windows, which would
+    # silently lose resolution there and corrupt every downstream dJk. Union
+    # with cur["t"] guarantees every original node survives.
+    t_new = np.union1d(grid, cur["t"])
+
+    A2 = _interp_to_grid(cur["A"], cur["t"], t_new)
+    XI2 = _interp_to_grid(cur["XI"], cur["t"], t_new)
+    B2 = _interp_to_grid(cur["B"], cur["t"], t_new)
+    ETA2 = _interp_to_grid(cur["ETA"], cur["t"], t_new)
+    alive_f2 = np.ones((len(t_new), XI2.shape[1]), dtype=bool)
+    alive_g2 = np.ones((len(t_new), ETA2.shape[1]), dtype=bool)
+    A2 = lp_weights_f(XI2, B2, ETA2, ub=_ub(alive_f2))   # restore exact
+    B2 = lp_weights_g(A2, XI2, ETA2, ub=_ub(alive_g2))   # feasibility
+    cur = dict(A=A2, XI=XI2, B=B2, ETA=ETA2, t=t_new, J=total_J(A2, XI2, B2, ETA2),
+              hist=[], alive_f=alive_f2, alive_g=alive_g2)
+    regrid_Jc = certify(cur, sub=sub)["Jc"]
+    if verbose:
+        print(f"  base J_certified = {base_Jc:.5f}  ->  regridded onto "
+              f"{len(t_new)} nodes, J_certified = {regrid_Jc:.5f}")
+    if abs(regrid_Jc - base_Jc) > 0.01 * abs(base_Jc):
+        raise RuntimeError(
+            f"regrid is not within 1% of base: base {base_Jc:.5f} vs "
+            f"regridded {regrid_Jc:.5f} -- fix the migration before "
+            f"trusting any dJk")
+
+    generations = []
+    J = regrid_Jc
+    for k in range(1, n_gen + 1):
+        w_k, window_k = ws[k - 1], windows[k - 1]
+        windowed = generation_step(cur, window_k, seeds=seeds, dx=dx,
+                                   outer=outer, pos_iters=pos_iters, sub=sub)
+        guard = generation_step(cur, (t0, t1), seeds=seeds, dx=dx,
+                                outer=outer, pos_iters=pos_iters, sub=sub)
+        dJk = windowed["Jc"] - J
+        guard_dJk = guard["Jc"] - J
+        if verbose:
+            print(f"  gen {k}: w_k={w_k:.4f}  Jc {J:.5f} -> "
+                  f"{windowed['Jc']:.5f}  dJk={dJk:+.5f}  "
+                  f"(feasible={windowed['feasible']})   guard: "
+                  f"{guard['Jc']:.5f}  guard_dJk={guard_dJk:+.5f}  "
+                  f"(feasible={guard['feasible']})")
+        generations.append(dict(
+            k=k, w_k=w_k, window=window_k, Jc=windowed["Jc"], dJk=dJk,
+            feasible=windowed["feasible"], guard_Jc=guard["Jc"],
+            guard_dJk=guard_dJk, guard_feasible=guard["feasible"],
+            diagnostics=windowed["diagnostics"], spread=windowed["spread"]))
+        cur, J = windowed["sol"], windowed["Jc"]
+    return dict(generations=generations, base_Jc=regrid_Jc)
 
 
 def grow_topology(base, n_gen=2, cand_seeds=range(2), dx=0.05, windows=None,
@@ -923,6 +1215,143 @@ if __name__ == "__main__":
     print(f"    uniform: {N_unif + 1:2d} nodes, {live_unif:3d} live vars for the "
           f"SAME local resolution ({live_unif / n_live_nodes(gcand):.1f}x more "
           f"variables; the win grows as the window narrows)")
+
+    print()
+    print("=" * 70)
+    print("Run 8 (Task D): the renormalization warm start -- and an HONEST")
+    print("  null result. If the hierarchy were self-similar, the next")
+    print("  generation of kinks would be an affinely-rescaled copy of the")
+    print("  current one (shorter lifetime, narrower extent, riding the")
+    print("  parent's path). spawn_generation() inserts exactly that contracted")
+    print("  copy at ZERO weight (Task B machinery, so J and feasibility are")
+    print("  unchanged at insertion -- verified below); a random insertion")
+    print("  (add_kink) drops the same new kink at a RANDOM position on the")
+    print("  same window. Both are re-optimized by the identical alternation.")
+    print("  Hoped-for acceptance: the warm start reaches a better J faster.")
+    print("  Measured: it does NOT. On Run 3's gen-0 optimum the contracted")
+    print("  copy lands nearly CO-LOCATED with its (barely-travelling) parent,")
+    print("  and two hats at one point are redundant in a convex sum -- so the")
+    print("  LP gives it ~no weight and it converges in 1-2 outers to a")
+    print("  SHALLOWER basin, while random insertion explores genuinely new")
+    print("  positions and does at least as well (and stays feasible). Reading:")
+    print("  the gen-0 optimum is not yet a self-similar travel hierarchy, so")
+    print("  the renormalization premise is unvalidated at k=0. Task D ships")
+    print("  the machinery to test it; whether self-similarity (and a warm-")
+    print("  start payoff) emerges at deeper generations is the open Section-5")
+    print("  question -- reported straight rather than tuned into a win.")
+    print("=" * 70)
+
+    G0 = prune(r2, 1e-8)                                 # Run 3 converged 3+2
+    J0 = certify(G0)["Jc"]
+    pf = int(np.abs(G0["A"]).max(axis=0).argmax())
+    pg = int(np.abs(G0["B"]).max(axis=0).argmax())
+    budget = 12
+
+    def _warm(XI2, ETA2, af2, ag2):
+        """Re-optimize from the bootstrapped seed; return (coarse-J curve,
+        certified J, feasible, convergence outer-iter)."""
+        A0, B0 = _seed_grown(G0, XI2, ETA2, af2, ag2)
+        r = _alternate(A0, XI2, B0, ETA2, G0["t"], af2, ag2, outer=budget,
+                       pos_iters=40, optimize_pos=True, verbose=False,
+                       patience=budget)                 # run full budget
+        curve = [jp for (_, jp) in r["hist"]]
+        conv = next((i + 1 for i in range(1, len(curve))
+                     if abs(curve[i] - curve[i - 1]) < 1e-5), len(curve))
+        c = certify(prune(r, 1e-8))
+        return curve, c["Jc"], c["rep"]["ALL CONSTRAINTS OK"], conv
+
+    # spawn arm: contracted copy of the finest carrier, one f + one g kink.
+    # spawn places both new kinks on [0.5, 1.0] (half the all-alive lifetime,
+    # at the travel end); match that window for the random arm so the ONLY
+    # difference is structured contraction vs random position.
+    Xs, Es, afs, ags = spawn_generation(G0, scale_t=0.5, scale_x=0.5,
+                                        rng=np.random.default_rng(0))
+    # J-neutral at insertion: the new columns carry ZERO weight (pad G0's
+    # weights with a zero column per grown family) -> total_J is exactly G0's,
+    # because a zero-weight g-kink has no jump and a zero-weight f-kink no rise.
+    A_pad = np.column_stack([G0["A"], np.zeros(G0["t"].size)])
+    B_pad = np.column_stack([G0["B"], np.zeros(G0["t"].size)])
+    J_ins = total_J(A_pad, Xs, B_pad, Es)
+    _, spawn_Jc, spawn_ok, spawn_conv = _warm(Xs, Es, afs, ags)
+
+    best_rand = (-np.inf, False, None, None)            # (Jc, ok, conv, seed)
+    for rs in range(4):
+        rr = np.random.default_rng(rs)
+        Xr, Er, afr, agr = add_kink("f", G0["XI"], G0["ETA"], G0["alive_f"],
+                                    G0["alive_g"], pf, G0["t"], 0.5, 1.0,
+                                    dx=0.3, rng=rr)
+        Xr, Er, afr, agr = add_kink("g", Xr, Er, afr, agr, pg, G0["t"],
+                                    0.5, 1.0, dx=0.3, rng=rr)
+        _, jc, ok, conv = _warm(Xr, Er, afr, agr)
+        if ok and jc > best_rand[0]:
+            best_rand = (jc, ok, conv, rs)
+    rand_Jc, rand_ok, rand_conv, rand_seed = best_rand
+
+    print(f"  G0 (Run 3): J_certified = {J0:.4f}")
+    print(f"  spawn insertion is J-neutral: J at insertion = {J_ins:.4f} "
+          f"(= J0 coarse {G0['J']:.4f}? {abs(J_ins - G0['J']) < 1e-6})")
+    print(f"  spawn : J_certified = {spawn_Jc:.4f} (dJ {spawn_Jc-J0:+.4f})  "
+          f"feasible = {spawn_ok}  converged in {spawn_conv} outers")
+    print(f"  random: J_certified = {rand_Jc:.4f} (dJ {rand_Jc-J0:+.4f})  "
+          f"feasible = {rand_ok}  converged in {rand_conv} outers  "
+          f"(best feasible of 4 seeds, #{rand_seed})")
+    win = spawn_ok and spawn_Jc >= rand_Jc - 1e-6
+    print(f"  -> warm start beats random: {win}  "
+          f"(null result: contracted copy is redundant at gen 0 -- the "
+          f"hierarchy is not yet self-similar; machinery is correct and ready "
+          f"for the multi-generation Section-5 test)")
+
+    print()
+    print("=" * 70)
+    print("Run 9 (Section 5): the generation-gain ladder -- the experiment")
+    print("  everything else in this file serves. Run 8 showed the warm start")
+    print("  (spawn_generation) is just an accelerator and doesn't beat random")
+    print("  insertion at gen 0; it does NOT block the measurement itself. This")
+    print("  run uses the already-working add_kink multistart (Run 8's random")
+    print("  arm) as the insertion mechanism, with one change that makes it a")
+    print("  measurement instead of a repeat of Runs 4-5: each generation's new")
+    print("  f-kink and g-kink get an IMPOSED lifetime window that halves every")
+    print("  generation (Run 6 showed an unrestricted greedy always prefers a")
+    print("  full lifetime -- more DOF wins -- so the window constraint is the")
+    print("  whole point). Records dJk = Jk - J_{k-1} per generation, plus a")
+    print("  guard arm (free, full-lifetime insertion) so a constant dJk can't")
+    print("  be an artifact of the imposed window geometry. Interpretation:")
+    print("  dJk roughly CONSTANT over generations supports the ln(Nx) mesh")
+    print("  growth being real (sup J = +infinity, approached not attained);")
+    print("  dJk DECAYING means J is bounded and the mesh growth was transient.")
+    print("=" * 70)
+
+    ladder = generation_ladder(G0, n_gen=3, window0=0.5, window_ratio=0.5,
+                               seeds=range(3), outer=25, pos_iters=60,
+                               coarse_N=8, base_fine_sub=4, sub=8)
+
+    print(f"\n  {'k':>2} {'w_k':>7} {'Jc':>8} {'dJk':>8} {'ok':>5}   "
+          f"{'guard_Jc':>8} {'guard_dJk':>9} {'ok':>5}")
+    for g in ladder["generations"]:
+        print(f"  {g['k']:>2} {g['w_k']:>7.4f} {g['Jc']:>8.4f} "
+              f"{g['dJk']:>+8.4f} {str(g['feasible']):>5}   "
+              f"{g['guard_Jc']:>8.4f} {g['guard_dJk']:>+9.4f} "
+              f"{str(g['guard_feasible']):>5}")
+        for fam in ("f", "g"):
+            d = g["diagnostics"][fam]
+            print(f"       +{fam}-kink: lifetime=({d['lifetime'][0]:.3f},"
+                  f"{d['lifetime'][1]:.3f})  extent=({d['extent'][0]:+.3f},"
+                  f"{d['extent'][1]:+.3f})  jump_mean={d['jump_mean']:.3f}  "
+                  f"offset_from_parent={d['offset_from_parent']:.3f}")
+        spread_str = ", ".join(f"seed{s}:{jc:.4f}{'' if ok else '(infeas)'}"
+                               for s, jc, ok in g["spread"])
+        print(f"       spread: {spread_str}")
+
+    dJks = [g["dJk"] for g in ladder["generations"]]
+    guard_dJks = [g["guard_dJk"] for g in ladder["generations"]]
+    print(f"\n  dJk sequence:       {[f'{d:+.4f}' for d in dJks]}")
+    print(f"  guard dJk sequence: {[f'{d:+.4f}' for d in guard_dJks]}")
+    print("  Reading these numbers is the open question this file was built")
+    print("  to answer -- see STRATEGY.md Section 5 for the interpretation")
+    print("  rule (constant vs decaying dJk) and the honesty requirements")
+    print("  (every Jc above is J_certified; the spread, not just the max, is")
+    print("  reported per generation; the guard arm is never adopted into the")
+    print("  ladder, only compared against it).")
 
     # EXT: adaptive per-kink time nodes (fine generations live fast & short)
     # EXT: warm-start next generation from a rescaled copy of this solution

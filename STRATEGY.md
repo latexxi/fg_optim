@@ -255,7 +255,7 @@ time-node count.
 > masks; that is sufficient for the generation experiment and far less
 > invasive than rewriting the LP/harvest assembly per-kink.
 
-### Task D — The renormalization warm start  [NOT STARTED]
+### Task D — The renormalization warm start  [DONE (machinery); acceptance NOT met at gen 0 — HONEST NULL, see below]
 
 If the hierarchy is self-similar, generation k+1 is approximately an
 affinely rescaled copy of generation k (shorter lifetime, narrower spatial
@@ -267,9 +267,33 @@ and re-optimize.
 Acceptance: spawning finds improvements faster (fewer outer iterations to a
 given J) than inserting randomly perturbed kinks.
 
+**Status (Run 8).** `spawn_generation(sol, scale_t, scale_x, families, rng)`
+is implemented: it picks each family's most-active kink (the current finest
+carrier), contracts that trajectory spatially by `scale_x` about the end of
+its travel path and temporally to a `scale_t`-fraction window at that end, and
+inserts the contracted copy at zero weight via `_insert_column` (verified
+J-neutral at insertion: J at insertion = G0's J exactly). The acceptance test
+is **not met on Run 3's gen-0 optimum**, reported straight rather than tuned:
+
+  - spawn: J_certified 2.3089 -> 2.3251 (dJ +0.016), feasible, converges in 2
+    outer iterations.
+  - random insertion (add_kink, best feasible of 4 seeds): 2.3089 -> 2.3700
+    (dJ +0.061), feasible, converges in 8 outers.
+
+The warm start converges *faster* but into a *shallower* basin, and does not
+beat random on J. **Root cause is structural, not a bug:** Run 3's gen-0
+optimum is not a self-similar travel hierarchy — its kinks barely travel, so
+contracting about the travel end yields a copy nearly co-located with its
+parent, and two hats at one point are redundant in a convex-hat sum (the LP
+gives it ~no weight). Probed across static/travel seeds, sparse/dense (up to
+6+5) bases, and wide/narrow windows: the null holds everywhere, and on the
+dense base spawn additionally lands infeasible. So Task D ships correct,
+reusable machinery, but the *renormalization premise it presupposes is
+unvalidated at k=0* — which is itself a finding (see Section 5 caveat).
+
 ---
 
-## 5. The experiment that everything serves  [NOT STARTED — Tasks B, C done, blocked on Task D]
+## 5. The experiment that everything serves  [BLOCKED — premise (self-similarity) unvalidated at gen 0; see Task D null]
 
 **Protocol (generation-gain measurement):**
 
@@ -290,6 +314,35 @@ given J) than inserting randomly perturbed kinks.
     support the conjecture sup J = +infinity (approached, never attained).
   - dJk DECAYING geometrically  =>  J is bounded; the mesh's log growth was
     a transient and the supremum is finite.
+
+**Premise caveat (added after the Task D null, Run 8).** This whole protocol
+leans on self-similarity in TWO distinct ways, and only one of them is load-
+bearing for the *conclusion*:
+  1. *As a warm-start convenience (Task D).* Step 2a spawns generation k as a
+     rescaled copy of k-1. If the optimum is self-similar this is a good
+     initial guess; if not, it is merely a bad guess and the re-optimization
+     (2b) still finds whatever the true generation-k improvement is — you just
+     pay more optimizer effort (or fall back to fresh multistart insertion,
+     which Run 8 shows already works). So the *measurement* dJk does NOT
+     depend on self-similarity holding; **the warm start is an accelerator,
+     not an assumption.** Run 8's null means the accelerator doesn't yet help
+     at k=0, not that the experiment is invalid — replace `spawn_generation`
+     with `add_kink`/`grow_topology` multistart insertion and the protocol
+     runs unchanged.
+  2. *As the physical interpretation (Section: "snaking inside snaking").* The
+     mental model — each generation rides on the previous one's path with a
+     fixed contraction ratio — is a *hypothesis being tested*, precisely by
+     the secondary measurements below. If generations do NOT settle to a fixed
+     ratio, that is a real result (the growth, if any, is not a clean
+     renormalization ladder), not a failure of the experiment.
+The dangerous, load-bearing assumption would be to *impose* a fixed
+contraction ratio and only ever spawn rescaled copies — then a constant dJk
+could be an artifact of the imposed geometry rather than a discovered law.
+Guard: at each generation ALSO try a from-scratch multistart insertion (Run 8
+random arm) and keep the honest best; only trust a constant-dJk law if it
+survives that free search. Run 8's finding (random beats the rescaled copy at
+k=0) means the free search is currently *stronger* than the self-similar warm
+start, so this guard is not optional — it is the actual workhorse for now.
 
 Secondary measurements to log per generation: lifetime and spatial extent
 of the new kinks after optimization (test self-similarity: do they settle
@@ -323,8 +376,9 @@ parent path (hypothesis: riding on it — "snaking inside snaking").
     _alternate (shared mask-aware block alternation); run (driver, accept/
     reject safeguard on the position step, `t=` to inject a non-uniform grid,
     Task C); multistart (reruns `run` over several `rng_seed` kink-jitters,
-    parallel across processes, keeps the best); add_kink, prune,
-    grow_topology (topology moves, Task B).
+    parallel across processes, keeps the best); add_kink, _insert_column,
+    prune, grow_topology (topology moves, Task B); _lifetime_window,
+    spawn_generation (renormalization warm start, Task D).
   - visualize.py : imports run/conv_eval/report from kink_opt.py, plots
     surfaces/heatmaps/slices/kink-trajectories for one solution. Not part
     of the task list above.
