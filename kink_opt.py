@@ -75,10 +75,33 @@ def conv_eval(x, w, xi):
     return -(hat_matrix(x, xi) * w[None, :]).sum(axis=1)
 
 
+def _wbounds(shape, dead_node, ub=None):
+    """Box bounds for a weight LP over a (Np1, K) weight matrix, flattened in
+    the same (k outer, kink inner) order the LPs index with.  `dead_node` is
+    the time index whose weights are pinned to 0 by a boundary condition
+    (k=N for f's terminal f(x,1)=0, k=0 for g's initial g(x,0)=0).  `ub` is an
+    optional (Np1, K) per-node upper bound (np.inf = unbounded); nodes with
+    ub=0 are 'dead', which is how a kink's lifetime window is imposed.  With
+    ub=None every non-dead node is unbounded, reproducing the original LPs
+    exactly (so all-alive topologies regress to the previous behaviour)."""
+    Np1, K = shape
+    if ub is None:
+        ub = np.full(shape, np.inf)
+    bounds = []
+    for k in range(Np1):
+        for i in range(K):
+            hi = 0.0 if k == dead_node else float(ub[k, i])
+            bounds.append((0.0, hi if np.isfinite(hi) else None))
+    return bounds
+
+
 # ------------------------------------------------------------- weight LPs
 
-def lp_weights_f(XI, B, ETA):
-    """Globally optimal f-weights A given all positions and g-weights."""
+def lp_weights_f(XI, B, ETA, ub=None):
+    """Globally optimal f-weights A given all positions and g-weights.
+    `ub` (Np1, Kf), if given, upper-bounds each weight per time node -- a 0
+    entry pins a kink dead there (lifetime windows, Task B); default None is
+    unbounded (original behaviour)."""
     Np1, Kf = XI.shape
     N = Np1 - 1
     nv = Np1 * Kf
@@ -113,8 +136,7 @@ def lp_weights_f(XI, B, ETA):
                 r[ix(k, i)] -= Hk[p, i]
             rows.append(r); rhs.append(0.0)
 
-    bounds = [(0.0, 0.0) if k == N else (0.0, None)
-              for k in range(Np1) for _ in range(Kf)]
+    bounds = _wbounds((Np1, Kf), dead_node=N, ub=ub)
     res = linprog(-c, A_ub=np.array(rows), b_ub=np.array(rhs),
                   bounds=bounds, method="highs")
     if not res.success:
@@ -122,8 +144,10 @@ def lp_weights_f(XI, B, ETA):
     return res.x.reshape(Np1, Kf)
 
 
-def lp_weights_g(A, XI, ETA):
-    """Globally optimal g-weights B given all positions and f-weights."""
+def lp_weights_g(A, XI, ETA, ub=None):
+    """Globally optimal g-weights B given all positions and f-weights.
+    `ub` (Np1, Kg), if given, upper-bounds each weight per time node (0 = dead
+    there), imposing lifetime windows (Task B); default None is unbounded."""
     Np1, Kg = ETA.shape
     N = Np1 - 1
     nv = Np1 * Kg
@@ -155,8 +179,7 @@ def lp_weights_g(A, XI, ETA):
                 r[ix(k + 1, m)] -= Hk1[p, m]
             rows.append(r); rhs.append(0.0)
 
-    bounds = [(0.0, 0.0) if k == 0 else (0.0, None)
-              for k in range(Np1) for _ in range(Kg)]
+    bounds = _wbounds((Np1, Kg), dead_node=0, ub=ub)
     res = linprog(-c, A_ub=np.array(rows), b_ub=np.array(rhs),
                   bounds=bounds, method="highs")
     if not res.success:
@@ -332,11 +355,14 @@ def grad_penalty(A, XI, B, ETA):
     return dXI, dETA
 
 
-def optimize_positions(A, XI, B, ETA, maxiter=40):
+def optimize_positions(A, XI, B, ETA, maxiter=40, alive_f=None, alive_g=None):
     """Nonconvex block: move kink trajectories, weights frozen.
     Always uses analytic gradients (grad_total_J + grad_penalty) via jac=,
     not L-BFGS-B's default finite differences -- there is no numerical-
-    gradient fallback path."""
+    gradient fallback path.
+    If lifetime masks (alive_f/alive_g) are supplied they are permuted by the
+    same per-row sort applied to the positions and returned alongside, so a
+    kink's dead/alive tag keeps tracking its position after re-ordering."""
     Np1, Kf = XI.shape
     Kg = ETA.shape[1]
     nxi = Np1 * Kf
@@ -361,8 +387,15 @@ def optimize_positions(A, XI, B, ETA, maxiter=40):
     res = minimize(obj, z0, jac=obj_grad, method="L-BFGS-B", bounds=bnds,
                    options=dict(maxiter=maxiter))
     XIn, ETAn = unpack(res.x)
-    XIn.sort(axis=1); ETAn.sort(axis=1)     # keep ordering after projection
-    return XIn, ETAn
+    of = np.argsort(XIn, axis=1)            # keep ordering after projection
+    og = np.argsort(ETAn, axis=1)
+    XIn = np.take_along_axis(XIn, of, axis=1)
+    ETAn = np.take_along_axis(ETAn, og, axis=1)
+    if alive_f is None and alive_g is None:
+        return XIn, ETAn
+    alive_f = np.take_along_axis(alive_f, of, axis=1)
+    alive_g = np.take_along_axis(alive_g, og, axis=1)
+    return XIn, ETAn, alive_f, alive_g
 
 
 # ----------------------------------------------------------- verification
@@ -377,6 +410,21 @@ def refine_time(A, XI, B, ETA, t, sub=8):
         return np.column_stack([np.interp(tf, t, M[:, j])
                                 for j in range(M.shape[1])])
     return interp(A), interp(XI), interp(B), interp(ETA), tf
+
+
+def _refine_mask(alive, t, tf):
+    """Map a coarse-grid lifetime mask (Np1, K) to a fine grid `tf`.  Each
+    column's window is contiguous, so it is fully described by its birth/death
+    times (first/last coarse node where it is alive); a fine node is alive iff
+    it lies in [birth, death].  All-alive columns map to all-alive (birth=t0,
+    death=t1), so certification of windowless solutions is unchanged."""
+    out = np.zeros((len(tf), alive.shape[1]), dtype=bool)
+    for j in range(alive.shape[1]):
+        idx = np.flatnonzero(alive[:, j])
+        if idx.size == 0:
+            continue
+        out[:, j] = (tf >= t[idx[0]] - 1e-12) & (tf <= t[idx[-1]] + 1e-12)
+    return out
 
 
 def verify_dense(A, XI, B, ETA, t, nx=1601, tol=2e-2):
@@ -418,6 +466,54 @@ def verify_dense(A, XI, B, ETA, t, nx=1601, tol=2e-2):
 
 # ----------------------------------------------------------------- driver
 
+def _ub(alive):
+    """Lifetime mask -> per-node weight upper bounds (inf where alive)."""
+    return np.where(alive, np.inf, 0.0)
+
+
+def _alternate(A, XI, B, ETA, t, alive_f, alive_g, outer=6, pos_iters=40,
+               optimize_pos=True, verbose=True, patience=3):
+    """Block-coordinate alternation (weight-LPs <-> position NLP) shared by
+    run() and grow_topology().  Lifetime masks pin dead kinks to zero weight
+    via the LP upper bounds and ride along the position sort.  Keeps the best
+    feasible state seen and reverts on regression (the position step is a
+    nonconvex NLP and is NOT guaranteed to improve J monotonically)."""
+    hist = []
+    best = (total_J(A, XI, B, ETA), A, XI, B, ETA, alive_f, alive_g)
+    stall = 0
+    for it in range(outer):
+        A = lp_weights_f(XI, B, ETA, ub=_ub(alive_f))
+        B = lp_weights_g(A, XI, ETA, ub=_ub(alive_g))
+        Jw = total_J(A, XI, B, ETA)
+        if optimize_pos:
+            XI, ETA, alive_f, alive_g = optimize_positions(
+                A, XI, B, ETA, maxiter=pos_iters,
+                alive_f=alive_f, alive_g=alive_g)
+            A = lp_weights_f(XI, B, ETA, ub=_ub(alive_f))   # restore feasib.
+            B = lp_weights_g(A, XI, ETA, ub=_ub(alive_g))
+        Jp = total_J(A, XI, B, ETA)
+        hist.append((Jw, Jp))
+        if verbose:
+            print(f"  outer {it}:  J after weight-LPs = {Jw:.5f}   "
+                  f"after position step = {Jp:.5f}")
+        if Jp > best[0]:
+            best = (Jp, A.copy(), XI.copy(), B.copy(), ETA.copy(),
+                    alive_f.copy(), alive_g.copy())
+            stall = 0
+        else:
+            stall += 1
+            A, XI, B, ETA, alive_f, alive_g = (
+                best[1].copy(), best[2].copy(), best[3].copy(),
+                best[4].copy(), best[5].copy(), best[6].copy())
+            if stall >= patience:
+                break
+        if it > 1 and abs(hist[-1][1] - hist[-2][1]) < 1e-6:
+            break
+    Jbest, A, XI, B, ETA, alive_f, alive_g = best
+    return dict(A=A, XI=XI, B=B, ETA=ETA, t=t, J=Jbest, hist=hist,
+                alive_f=alive_f, alive_g=alive_g)
+
+
 def run(N=24, Kf=3, Kg=2, outer=6, seed="travel", pos_iters=40,
         optimize_pos=True, verbose=True, patience=3, rng_seed=0):
     t = np.linspace(0.0, 1.0, N + 1)
@@ -438,39 +534,11 @@ def run(N=24, Kf=3, Kg=2, outer=6, seed="travel", pos_iters=40,
     B = np.outer(t, np.ones(Kg)) * 0.4 / Kg         # feasible ramp to bootstrap
     A = lp_weights_f(XI, B, ETA)
 
-    hist = []
-    best = (total_J(A, XI, B, ETA), A, XI, B, ETA)   # accept/reject anchor
-    stall = 0
-    for it in range(outer):
-        A = lp_weights_f(XI, B, ETA)
-        B = lp_weights_g(A, XI, ETA)
-        Jw = total_J(A, XI, B, ETA)
-        if optimize_pos:
-            XI, ETA = optimize_positions(A, XI, B, ETA, maxiter=pos_iters)
-            A = lp_weights_f(XI, B, ETA)            # restore exact feasibility
-            B = lp_weights_g(A, XI, ETA)
-        Jp = total_J(A, XI, B, ETA)
-        hist.append((Jw, Jp))
-        if verbose:
-            print(f"  outer {it}:  J after weight-LPs = {Jw:.5f}   "
-                  f"after position step = {Jp:.5f}")
-        # position step is a nonconvex NLP block and is NOT guaranteed to
-        # improve Jp monotonically (penalty tradeoffs + re-projection can
-        # regress it). Keep the best feasible state seen and revert to it
-        # on regression instead of drifting away from the optimum.
-        if Jp > best[0]:
-            best = (Jp, A.copy(), XI.copy(), B.copy(), ETA.copy())
-            stall = 0
-        else:
-            stall += 1
-            A, XI, B, ETA = (best[1].copy(), best[2].copy(),
-                              best[3].copy(), best[4].copy())
-            if stall >= patience:
-                break
-        if it > 1 and abs(hist[-1][1] - hist[-2][1]) < 1e-6:
-            break
-    Jbest, A, XI, B, ETA = best
-    return dict(A=A, XI=XI, B=B, ETA=ETA, t=t, J=Jbest, hist=hist)
+    alive_f = np.ones((N + 1, Kf), dtype=bool)       # every kink alive always
+    alive_g = np.ones((N + 1, Kg), dtype=bool)
+    return _alternate(A, XI, B, ETA, t, alive_f, alive_g, outer=outer,
+                      pos_iters=pos_iters, optimize_pos=optimize_pos,
+                      verbose=verbose, patience=patience)
 
 
 def _multistart_worker(args):
@@ -503,27 +571,158 @@ def multistart(seeds=range(6), workers=None, **kwargs):
     return best
 
 
-def report(tag, r, sub=8):
-    """Honest J: interpolate to a sub x finer time grid, REPAIR feasibility by
-    re-solving the (convex) weight LPs there with positions frozen, then
-    verify every constraint on a dense grid. The number printed as
-    J_certified is achieved by a fully feasible pair."""
+def certify(r, sub=8):
+    """Honest J without printing: interpolate to a sub x finer time grid,
+    REPAIR feasibility by re-solving the (convex) weight LPs there with
+    positions frozen, then verify every constraint on a dense grid.  If the
+    solution carries lifetime masks (alive_f/alive_g), the fine-grid repair
+    respects those windows so measured J reflects the imposed lifetimes;
+    without masks it re-solves the weights freely (original behaviour).
+    Returns dict(J_interp, Jc, rep)."""
     Af, XIf, Bf, ETAf, tf = refine_time(r["A"], r["XI"], r["B"], r["ETA"],
                                         r["t"], sub=sub)
     J_interp = total_J(Af, XIf, Bf, ETAf)
+    af, ag = r.get("alive_f"), r.get("alive_g")
+    ub_f = _ub(_refine_mask(af, r["t"], tf)) if af is not None else None
+    ub_g = _ub(_refine_mask(ag, r["t"], tf)) if ag is not None else None
     # repair: weights re-optimized on the fine grid (positions fixed) --
-    # this both restores exact feasibility and can only be done because
-    # the weight blocks are LPs.
-    Af = lp_weights_f(XIf, Bf, ETAf)
-    Bf = lp_weights_g(Af, XIf, ETAf)
+    # restores exact feasibility; only possible because the weight blocks
+    # are LPs.
+    Af = lp_weights_f(XIf, Bf, ETAf, ub=ub_f)
+    Bf = lp_weights_g(Af, XIf, ETAf, ub=ub_g)
     Jc = total_J(Af, XIf, Bf, ETAf)
     rep = verify_dense(Af, XIf, Bf, ETAf, tf)
+    return dict(J_interp=J_interp, Jc=Jc, rep=rep)
+
+
+def report(tag, r, sub=8):
+    """Print certify()'s honest J. The number printed as J_certified is
+    achieved by a fully feasible pair (window-aware when masks are present)."""
+    c = certify(r, sub=sub)
     seed_tag = f"   rng_seed = {r['rng_seed']}" if "rng_seed" in r else ""
     print(f"  [{tag}]  J_coarse = {r['J']:.5f}   J_interp(x{sub}) = "
-          f"{J_interp:.5f}   J_certified = {Jc:.5f}"
-          f"   dense_check = {rep['J (dense cross-check)']:.5f}"
-          f"   constraints_ok = {rep['ALL CONSTRAINTS OK']}{seed_tag}")
-    return Jc
+          f"{c['J_interp']:.5f}   J_certified = {c['Jc']:.5f}"
+          f"   dense_check = {c['rep']['J (dense cross-check)']:.5f}"
+          f"   constraints_ok = {c['rep']['ALL CONSTRAINTS OK']}{seed_tag}")
+    return c["Jc"]
+
+
+# -------------------------------------------------------- topology moves (B)
+
+def add_kink(family, XI, ETA, alive_f, alive_g, parent, t,
+             t_birth, t_death, dx=0.05, rng=None):
+    """Insert a new kink trajectory as a small perturbation of an existing
+    `parent` column of the chosen family ("f" or "g"), alive only on
+    [t_birth, t_death].  The new column carries NO weight yet (the caller
+    re-solves the weight LPs), so J and feasibility are unchanged at insertion.
+    Returns (XI, ETA, alive_f, alive_g) with one family's matrices grown by a
+    column.  A dead node (weight pinned to 0 outside the window) contributes
+    nothing to f/g, so its position is a free, harmless extra checkpoint until
+    the window opens."""
+    jit = dx * (rng.standard_normal() if rng is not None else 1.0)
+    win = (t >= t_birth - 1e-12) & (t <= t_death + 1e-12)
+    src = (XI[:, parent] if family == "f" else ETA[:, parent]) + jit
+    return _insert_column(family, XI, ETA, alive_f, alive_g, src, win)
+
+
+def _insert_column(family, XI, ETA, alive_f, alive_g, col, win):
+    """Append one kink trajectory `col` (Np1,) to `family` with lifetime mask
+    `win` (Np1, bool); positions clipped into bounds.  Shared by add_kink
+    (perturbed copy, Task B) and spawn_generation (contracted copy, Task D)."""
+    col = np.clip(np.asarray(col, float), -1 + MARGIN, 1 - MARGIN)
+    if family == "f":
+        return (np.column_stack([XI, col]), ETA,
+                np.column_stack([alive_f, win]), alive_g)
+    if family == "g":
+        return (XI, np.column_stack([ETA, col]),
+                alive_f, np.column_stack([alive_g, win]))
+    raise ValueError("family must be 'f' or 'g'")
+
+
+def prune(r, tol=1e-8):
+    """Drop kinks whose |weight| stays below `tol` at every time node (dead
+    trajectories the LP never used).  Keeps at least one kink per family."""
+    A, XI, B, ETA = r["A"], r["XI"], r["B"], r["ETA"]
+    af, ag = r["alive_f"], r["alive_g"]
+    kf = np.abs(A).max(axis=0) > tol
+    kg = np.abs(B).max(axis=0) > tol
+    if not kf.any():
+        kf[np.abs(A).max(axis=0).argmax()] = True
+    if not kg.any():
+        kg[np.abs(B).max(axis=0).argmax()] = True
+    out = dict(r)
+    out["A"], out["XI"], out["alive_f"] = A[:, kf], XI[:, kf], af[:, kf]
+    out["B"], out["ETA"], out["alive_g"] = B[:, kg], ETA[:, kg], ag[:, kg]
+    return out
+
+
+def grow_topology(base, n_gen=2, cand_seeds=range(2), dx=0.05, windows=None,
+                  tol=1e-4, outer=20, pos_iters=40, patience=5, sub=8,
+                  verbose=True):
+    """Task B driver: from a converged solution, greedily birth one kink at a
+    time.  Each generation tries inserting into each family, over a few
+    lifetime windows and jitter seeds; every candidate is re-optimized with
+    the block alternation, pruned, and certified.  The best candidate is kept
+    only if J_certified strictly improves by more than `tol`; otherwise the
+    search stops.  `windows` is a list of (t_birth, t_death); default probes a
+    full lifetime plus two shorter co-moving windows.  Returns the grown
+    solution dict (with lifetime masks)."""
+    cur = prune(base, tol=1e-8)
+    curJ = certify(cur, sub=sub)["Jc"]
+    if verbose:
+        print(f"  base J_certified = {curJ:.5f}  "
+              f"(Kf={cur['XI'].shape[1]}, Kg={cur['ETA'].shape[1]})")
+
+    for gen in range(1, n_gen + 1):
+        t = cur["t"]
+        win_list = windows if windows is not None else [
+            (t[0], t[-1]), (0.5, 1.0), (0.6, 0.9)]
+        best_cand, best_candJ, best_desc = None, curJ + tol, None
+
+        for family in ("f", "g"):
+            W = cur["A"] if family == "f" else cur["B"]
+            parent = int(np.abs(W).max(axis=0).argmax())   # most active kink
+            for (tb, td) in win_list:
+                for cs in cand_seeds:
+                    rng = np.random.default_rng(1000 * gen + cs)
+                    XI2, ETA2, af2, ag2 = add_kink(
+                        family, cur["XI"], cur["ETA"], cur["alive_f"],
+                        cur["alive_g"], parent, t, tb, td, dx=dx, rng=rng)
+                    # bootstrap weights for the grown dimensions (zero-weight
+                    # insertion => this re-solve starts from the current soln).
+                    # The unchanged family's current weights seed the first LP.
+                    if family == "f":
+                        A0 = lp_weights_f(XI2, cur["B"], ETA2, ub=_ub(af2))
+                    else:
+                        A0 = cur["A"]
+                    B0 = lp_weights_g(A0, XI2, ETA2, ub=_ub(ag2))
+                    A0 = lp_weights_f(XI2, B0, ETA2, ub=_ub(af2))
+                    cand = _alternate(A0, XI2, B0, ETA2, t, af2, ag2,
+                                      outer=outer, pos_iters=pos_iters,
+                                      optimize_pos=True, verbose=False,
+                                      patience=patience)
+                    cand = prune(cand, tol=1e-8)
+                    c = certify(cand, sub=sub)
+                    if not c["rep"]["ALL CONSTRAINTS OK"]:
+                        continue
+                    if c["Jc"] > best_candJ:
+                        best_cand, best_candJ = cand, c["Jc"]
+                        best_desc = (family, tb, td, cs)
+
+        if best_cand is None:
+            if verbose:
+                print(f"  gen {gen}: no accepted insertion "
+                      f"(no candidate beat {curJ:.5f} + {tol}); stopping.")
+            break
+        fam, tb, td, cs = best_desc
+        if verbose:
+            print(f"  gen {gen}: ACCEPT  +{fam}-kink on "
+                  f"[{tb:.2f},{td:.2f}] (seed {cs})   "
+                  f"J_certified {curJ:.5f} -> {best_candJ:.5f}   "
+                  f"(Kf={best_cand['XI'].shape[1]}, "
+                  f"Kg={best_cand['ETA'].shape[1]})")
+        cur, curJ = best_cand, best_candJ
+    return cur
 
 
 if __name__ == "__main__":
@@ -582,7 +781,22 @@ if __name__ == "__main__":
                      seed="static", pos_iters=80, patience=6)
     report("multistart 6+5", r4)
 
-    # EXT: add/remove kinks between outer iterations (topology moves)
+    print()
+    print("=" * 70)
+    print("Run 6 (Task B): topology moves -- birth/prune kinks between")
+    print("  alternations. Starting from Run 3's converged 3+2 solution,")
+    print("  grow_topology() greedily inserts one zero-weight kink at a time")
+    print("  (a perturbed copy of the most active kink, alive only on a")
+    print("  lifetime window), re-optimizes with the block alternation, prunes")
+    print("  dead trajectories, and KEEPS the insertion only if J_certified")
+    print("  strictly improves. Unlike Runs 4-5 (fixed K, brute-force more")
+    print("  kinks + restarts) this is the add/prune machinery the")
+    print("  hierarchical generation-spawning experiment (Task D) builds on.")
+    print("=" * 70)
+    grown = grow_topology(r2, n_gen=2, cand_seeds=range(2), outer=20,
+                          pos_iters=40, patience=5)
+    report("grown topo", grown)
+
     # EXT: adaptive per-kink time nodes (fine generations live fast & short)
     # EXT: warm-start next generation from a rescaled copy of this solution
     # EXT: multistart currently reseeds from scratch per attempt; a real
