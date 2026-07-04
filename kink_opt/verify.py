@@ -147,13 +147,20 @@ def _ub(alive):
     return np.where(alive, np.inf, 0.0)
 
 
-def certify(r, sub=8):
+def certify(r, sub=8, lip_rhs=None, rise_cap=None):
     """Honest J without printing: interpolate to a sub x finer time grid,
     REPAIR feasibility by re-solving the (convex) weight LPs there with
     positions frozen, then verify every constraint on a dense grid.  If the
     solution carries lifetime masks (alive_f/alive_g), the fine-grid repair
     respects those windows so measured J reflects the imposed lifetimes;
     without masks it re-solves the weights freely (original behaviour).
+
+    Run-13 cell (§5A): `lip_rhs` (Np1, 2) and/or `rise_cap` (xs, rho), if given,
+    are re-applied on the fine grid so the repaired J reflects the injected
+    environment (without them the repair re-solves the LPs freely and washes the
+    injection out -- meaningless certified J for a non-flat cell). `lip_rhs` is
+    interpolated onto the fine grid like the weights; `rise_cap` is x-space and
+    passes through unchanged. Default None = original behaviour, unchanged.
     Returns dict(J_interp, Jc, rep)."""
     Af, XIf, Bf, ETAf, tf = refine_time(r["A"], r["XI"], r["B"], r["ETA"],
                                         r["t"], sub=sub)
@@ -161,11 +168,12 @@ def certify(r, sub=8):
     af, ag = r.get("alive_f"), r.get("alive_g")
     ub_f = _ub(_refine_mask(af, r["t"], tf)) if af is not None else None
     ub_g = _ub(_refine_mask(ag, r["t"], tf)) if ag is not None else None
+    lipf = _interp_to_grid(lip_rhs, r["t"], tf) if lip_rhs is not None else None
     # repair: weights re-optimized on the fine grid (positions fixed) --
     # restores exact feasibility; only possible because the weight blocks
-    # are LPs.
-    Af = lp_weights_f(XIf, Bf, ETAf, ub=ub_f)
-    Bf = lp_weights_g(Af, XIf, ETAf, ub=ub_g)
+    # are LPs.  Injected environment (lipf/rise_cap) re-applied so J reflects it.
+    Af = lp_weights_f(XIf, Bf, ETAf, ub=ub_f, lip_rhs=lipf, rise_cap=rise_cap)
+    Bf = lp_weights_g(Af, XIf, ETAf, ub=ub_g, lip_rhs=lipf)
     Jc = total_J(Af, XIf, Bf, ETAf)
     rep = verify_dense(Af, XIf, Bf, ETAf, tf)
     return dict(J_interp=J_interp, Jc=Jc, rep=rep)
