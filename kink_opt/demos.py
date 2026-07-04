@@ -10,8 +10,8 @@ from .solver import run, multistart, _alternate
 from .verify import certify, report, n_live_nodes, graded_grid, _ub
 from .topology import (add_kink, spawn_generation, _seed_grown, prune,
                        grow_topology, generation_ladder, scale_sweep,
-                       decay_ratios, _gate_report, _budget_stable,
-                       generation_step)
+                       decay_ratios, corrected_decay_ratios, _gate_report,
+                       _budget_stable, generation_step)
 from .persist import save_run, save_ladder, save_sweep
 
 
@@ -403,10 +403,16 @@ def main():
                                     pos_iters=100, coarse_N=8, base_fine_sub=4,
                                     sub=8, verbose=False)
             dr = decay_ratios(lad["generations"])
+            cdr = corrected_decay_ratios(lad["generations"])
             dJks10 = [g["dJk"] for g in lad["generations"]]
+            cdJks10 = [g["corrected_dJk"] for g in lad["generations"]]
+            cns10 = [g["corrected_dJk_n"] for g in lad["generations"]]
             print(f"  base={base_name:5s} window_ratio={wr:.1f}  "
                   f"dJk={[f'{d:+.4f}' for d in dJks10]}  "
                   f"decay_ratios={[f'{r:.3f}' for r in dr]}")
+            print(f"    corrected_dJk={[f'{d:+.4f}' for d in cdJks10]}  "
+                  f"n={cns10}  "
+                  f"corrected_decay_ratios={[f'{r:.3f}' for r in cdr]}")
             save_ladder(f"run10_ratio_{base_name}_{wr}", lad,
                        meta=dict(base=base_name, n_gen=3, window0=0.5,
                                 window_ratio=wr, seeds=list(range(5)),
@@ -414,17 +420,22 @@ def main():
                                 base_fine_sub=4, sub=8))
             ratio_runs.append((base_name, wr, dr))
 
-    print("\n  Reading: if Experiment 1's corrected_dJ(w) trends to zero as w")
-    print("  shrinks, and Experiment 2's decay_ratios cluster near their own")
-    print("  window_ratio (0.7-ish for the wr=0.7 runs, 0.3-ish for wr=0.3),")
-    print("  both point at 'J bounded, log growth was a discretization")
-    print("  transient'. A flat corrected_dJ(w) or ratio-independent decay")
-    print("  would overturn that reading. IMPORTANT CAVEAT: Experiment 2's")
-    print("  dJk above has NOT been null-corrected (generation_ladder doesn't")
-    print("  run a force_dead arm yet) -- given Experiment 1's finding that")
-    print("  search-noise alone can rival or exceed the real windowed dJ, the")
-    print("  window_ratio numbers should be read as suggestive, not settled,")
-    print("  until a null-corrected ladder is run. See")
+    print("\n  Reading: read corrected_decay_ratios, not decay_ratios -- raw")
+    print("  dJk carries the same search-noise contamination Experiment 1")
+    print("  found (a dead new kink can still move Jc via the multi-seed")
+    print("  search finding a better basin for the OLD kinks). AT seeds=5,")
+    print("  the result is WORSE than inconclusive: the paired stat needs a")
+    print("  seed feasible in BOTH the windowed and null arms, and n above")
+    print("  collapses to 0-1 for 3 of the 4 (base, window_ratio) combos --")
+    print("  not enough to read a trend at all. Only base=G0, window_ratio=0.7")
+    print("  keeps n=2-4, and even there corrected_dJk flips sign across")
+    print("  generations with no se-separated pattern. Same lesson Experiment")
+    print("  1 already learned: 5 seeds looks fine for raw dJk optics but")
+    print("  starves the paired statistic -- Experiment 1 needed 16 seeds to")
+    print("  get n=1-10. Escalating Experiment 2 the same way is the next")
+    print("  step if this discriminator is worth pursuing further; as run")
+    print("  here it should NOT be read for a window_ratio-tracking signal.")
+    print("  See")
     print("  run10-scale-sweep-discriminators.md Experiments 4 (falsifiable")
     print("  gen4 extrapolation) and 5 (constructive arm) for what to run")
     print("  next -- not run automatically here since Experiment 4 needs an")

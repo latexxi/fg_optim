@@ -47,10 +47,15 @@ def total_J(A, XI, B, ETA):
     return float((jm * (f_hi - f_lo)).sum())
 
 
-def grad_total_J(A, XI, B, ETA):
-    """Analytic d(total_J)/d(XI), d(total_J)/d(ETA), weights A,B held fixed.
-    J is closed-form in the positions (piecewise rational-linear via the
-    hat basis), so this replaces L-BFGS-B's finite-difference gradient."""
+def _total_J_value_grad(A, XI, B, ETA):
+    """Fused value+gradient of total_J: one `_hat_b_parts` pass per (lo,hi)
+    block instead of `total_J`'s value-only `_hat_b` pass PLUS a separate
+    `_hat_b_parts` pass for the gradient -- the position NLP's `obj`/
+    `obj_grad` used to make both passes at the same (A,XI,B,ETA) every
+    L-BFGS-B iteration, computing the same hat values twice. Used only by
+    `optimize_positions`'s combined objective; `total_J`/`grad_total_J`
+    (still separate, still cheap standalone) are unchanged for the many
+    value-only call sites elsewhere (verify.py, solver.py, topology.py)."""
     em = 0.5 * (ETA[:-1] + ETA[1:])                  # (N,Kg)
     bm = 0.5 * (B[:-1] + B[1:])
     denom = 1.0 - em ** 2
@@ -62,6 +67,7 @@ def grad_total_J(A, XI, B, ETA):
     f_lo = -(Hlo * A[:-1, None, :]).sum(-1)
     f_hi = -(Hhi * A[1:, None, :]).sum(-1)
     step = f_hi - f_lo
+    J = float((jm * step).sum())
 
     dXI = np.zeros_like(XI)
     dXI[:-1] += A[:-1] * np.einsum('km,kmi->ki', jm, dHlo_dxi)
@@ -73,6 +79,18 @@ def grad_total_J(A, XI, B, ETA):
     dETA = np.zeros_like(ETA)
     dETA[:-1] += 0.5 * dterm_dem
     dETA[1:] += 0.5 * dterm_dem
+    return J, dXI, dETA
+
+
+def grad_total_J(A, XI, B, ETA):
+    """Analytic d(total_J)/d(XI), d(total_J)/d(ETA), weights A,B held fixed.
+    J is closed-form in the positions (piecewise rational-linear via the
+    hat basis), so this replaces L-BFGS-B's finite-difference gradient.
+    Thin wrapper over `_total_J_value_grad` (discards the value) -- kept
+    standalone so the public API/signature is unchanged for anyone calling
+    it directly (e.g. the finite-difference check in CLAUDE.md's "Analytic
+    gradients" section)."""
+    _, dXI, dETA = _total_J_value_grad(A, XI, B, ETA)
     return dXI, dETA
 
 
@@ -172,11 +190,99 @@ def grad_penalty(A, XI, B, ETA):
     return dXI, dETA
 
 
+def _step_diff_value_grad(W, P, activation):
+    """Fused value (post-activation sum-of-squares contribution to penalty)
+    and gradient of one step_diff family, from a SINGLE `_hat_b_parts` pass
+    per (lo,hi) block. Supersedes the old pattern of a value-only
+    `step_diff` (via `_hat_b`) to get `chi`, followed by `_step_diff_grad`
+    recomputing the same hats via `_hat_b_parts` just to get partials --
+    `_hat_b_parts` already returns H for free, so `chi` is derived from the
+    same H used for the gradient instead of a second hat evaluation.
+    `activation` is `np.minimum` or `np.maximum` (vs 0), selecting f_t>=0 /
+    g_t<=0. See `_step_diff_grad`'s docstring for the node/eval-point
+    gradient derivation this reuses verbatim."""
+    K = P.shape[1]
+    Wlo, Whi = W[:-1], W[1:]
+    Plo, Phi = P[:-1], P[1:]
+    xc = np.concatenate([Plo, Phi], axis=1)
+    Hlo, dHlo_dx, dHlo_dxi = _hat_b_parts(xc, Plo)
+    Hhi, dHhi_dx, dHhi_dxi = _hat_b_parts(xc, Phi)
+    lo = -(Hlo * Wlo[:, None, :]).sum(-1)
+    hi = -(Hhi * Whi[:, None, :]).sum(-1)
+    step = hi - lo
+    chi = activation(step, 0.0)
+    p = float((chi ** 2).sum())
+
+    chi_lo, chi_hi = chi[:, :K], chi[:, K:]
+    dHll_dx, dHlh_dx = dHlo_dx[:, :K], dHlo_dx[:, K:]
+    dHll_dxi, dHlh_dxi = dHlo_dxi[:, :K], dHlo_dxi[:, K:]
+    dHhl_dx, dHhh_dx = dHhi_dx[:, :K], dHhi_dx[:, K:]
+    dHhl_dxi, dHhh_dxi = dHhi_dxi[:, :K], dHhi_dxi[:, K:]
+
+    Sx_ll = np.einsum('ki,kqi->kq', Wlo, dHll_dx)
+    Sx_hl = np.einsum('ki,kqi->kq', Whi, dHhl_dx)
+    Sx_hh = np.einsum('ki,kqi->kq', Whi, dHhh_dx)
+    Sx_lh = np.einsum('ki,kqi->kq', Wlo, dHlh_dx)
+
+    Node_ll = np.einsum('kq,kqj->kj', chi_lo, dHll_dxi)
+    Node_lh = np.einsum('kq,kqj->kj', chi_hi, dHlh_dxi)
+    Node_hl = np.einsum('kq,kqj->kj', chi_lo, dHhl_dxi)
+    Node_hh = np.einsum('kq,kqj->kj', chi_hi, dHhh_dxi)
+
+    dP_lo = 2.0 * Wlo * (Node_ll + Node_lh) + 2.0 * chi_lo * (Sx_ll - Sx_hl)
+    dP_hi = -2.0 * Whi * (Node_hh + Node_hl) - 2.0 * chi_hi * (Sx_hh - Sx_lh)
+
+    dP = np.zeros_like(P)
+    dP[:-1] += dP_lo
+    dP[1:] += dP_hi
+    return p, dP
+
+
+def _penalty_value_grad(A, XI, B, ETA):
+    """Fused value+gradient of penalty(), built on `_step_diff_value_grad`
+    (one hat pass per step_diff family instead of two). Used only by
+    `optimize_positions`'s combined objective; `penalty`/`grad_penalty`
+    (still separate) are unchanged for standalone/finite-difference use."""
+    p = 0.0
+    dXI = np.zeros_like(XI)
+    dETA = np.zeros_like(ETA)
+
+    for P, dP in ((XI, dXI), (ETA, dETA)):                # kink ordering
+        if P.shape[1] > 1:
+            d = P[:, 1:] - P[:, :-1]
+            e = np.minimum(d - GAP, 0.0)
+            p += float((e ** 2).sum())
+            dP[:, :-1] += -2.0 * e
+            dP[:, 1:] += 2.0 * e
+
+    pf, dXI_f = _step_diff_value_grad(A, XI, np.minimum)   # f_t >= 0
+    pg, dETA_g = _step_diff_value_grad(B, ETA, np.maximum)  # g_t <= 0
+    p += pf + pg
+    dXI += dXI_f
+    dETA += dETA_g
+
+    for W, P, dP in ((A, XI, dXI), (B, ETA, dETA)):        # Lipschitz
+        e1 = np.maximum((W / (1.0 + P)).sum(1) - 1.0, 0.0)
+        p += float((e1 ** 2).sum())
+        dP += 2.0 * e1[:, None] * (-W / (1.0 + P) ** 2)
+        e2 = np.maximum((W / (1.0 - P)).sum(1) - 1.0, 0.0)
+        p += float((e2 ** 2).sum())
+        dP += 2.0 * e2[:, None] * (W / (1.0 - P) ** 2)
+    return p, dXI, dETA
+
+
 def optimize_positions(A, XI, B, ETA, maxiter=40, alive_f=None, alive_g=None):
     """Nonconvex block: move kink trajectories, weights frozen.
-    Always uses analytic gradients (grad_total_J + grad_penalty) via jac=,
-    not L-BFGS-B's default finite differences -- there is no numerical-
-    gradient fallback path.
+    Always uses analytic gradients via a single combined value+gradient
+    callback (`jac=True`), not L-BFGS-B's default finite differences -- there
+    is no numerical-gradient fallback path. The combined callback (built on
+    `_total_J_value_grad`/`_penalty_value_grad`) computes the hat basis ONCE
+    per L-BFGS-B iteration; a prior version called separate value-only
+    (`total_J`/`penalty`) and gradient-only (`grad_total_J`/`grad_penalty`)
+    functions, which scipy invokes at the same point every iteration since
+    they're independent Python callables with no shared cache -- doubling
+    hat-basis evaluations (the single largest cost in this file; see
+    `plans/` profiling notes) for no benefit.
     If lifetime masks (alive_f/alive_g) are supplied they are permuted by the
     same per-row sort applied to the positions and returned alongside, so a
     kink's dead/alive tag keeps tracking its position after re-ordering."""
@@ -187,21 +293,18 @@ def optimize_positions(A, XI, B, ETA, maxiter=40, alive_f=None, alive_g=None):
     def unpack(z):
         return z[:nxi].reshape(Np1, Kf), z[nxi:].reshape(Np1, Kg)
 
-    def obj(z):
+    def fun(z):
         XIz, ETAz = unpack(z)
-        return -total_J(A, XIz, B, ETAz) + PEN_W * penalty(A, XIz, B, ETAz)
-
-    def obj_grad(z):
-        XIz, ETAz = unpack(z)
-        dJ_XI, dJ_ETA = grad_total_J(A, XIz, B, ETAz)
-        dP_XI, dP_ETA = grad_penalty(A, XIz, B, ETAz)
+        J, dJ_XI, dJ_ETA = _total_J_value_grad(A, XIz, B, ETAz)
+        p, dP_XI, dP_ETA = _penalty_value_grad(A, XIz, B, ETAz)
+        f = -J + PEN_W * p
         gXI = -dJ_XI + PEN_W * dP_XI
         gETA = -dJ_ETA + PEN_W * dP_ETA
-        return np.concatenate([gXI.ravel(), gETA.ravel()])
+        return f, np.concatenate([gXI.ravel(), gETA.ravel()])
 
     z0 = np.concatenate([XI.ravel(), ETA.ravel()])
     bnds = [(-1.0 + MARGIN, 1.0 - MARGIN)] * z0.size
-    res = minimize(obj, z0, jac=obj_grad, method="L-BFGS-B", bounds=bnds,
+    res = minimize(fun, z0, jac=True, method="L-BFGS-B", bounds=bnds,
                    options=dict(maxiter=maxiter))
     XIn, ETAn = unpack(res.x)
     of = np.argsort(XIn, axis=1)            # keep ordering after projection

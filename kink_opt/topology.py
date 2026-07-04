@@ -336,6 +336,19 @@ def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
     only and is never adopted, so this can't quietly degrade into the
     unrestricted growth of Runs 4-5.
 
+    Each generation ALSO runs a NULL-CONTROL arm (`force_dead=True`, the same
+    Run 10 fix already applied to `scale_sweep` -- see that function's
+    docstring for the full contamination mechanism: insertion jitter alone
+    can move the OLD kinks to a better local optimum via the multi-seed
+    search, independent of any value the new kink provides, so raw `dJk` is
+    not trustworthy on its own). `corrected_dJk` is `_paired_dJ(windowed
+    spread, null spread)` -- per-seed differencing, not a plain `Jk -
+    null_Jk` best-of-max subtraction (same reasoning as `scale_sweep`).
+    Before this arm existed, this docstring described `dJk` as the
+    generation gain; that was only ever the UNCORRECTED number -- read
+    `corrected_dJk`/`corrected_dJk_se` instead, and treat plain `dJk` as
+    contaminated by search noise the same way `scale_sweep`'s raw `dJ` was.
+
     `budget_fn(k, n_live)`, if given, overrides the flat `outer`/`pos_iters`
     per generation (`n_live = cur["XI"].shape[1] + cur["ETA"].shape[1]`,
     the accumulated kink count going INTO generation k) -> `(outer_k,
@@ -346,8 +359,9 @@ def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
     ladder, and a flat per-ladder budget silently starves later generations).
 
     Returns dict(generations=[dict(k, w_k, window, Jc, dJk, feasible,
-    guard_Jc, guard_dJk, guard_feasible, diagnostics, spread, sol), ...],
-    base_Jc)."""
+    guard_Jc, guard_dJk, guard_feasible, null_Jc, null_dJk, null_feasible,
+    corrected_dJk, corrected_dJk_se, corrected_dJk_n, diagnostics, spread,
+    sol), ...], base_Jc)."""
     cur = prune(base, tol=1e-8)
     t0, t1 = cur["t"][0], cur["t"][-1]
     ws = [window0 * window_ratio**(k - 1) for k in range(1, n_gen + 1)]
@@ -370,18 +384,32 @@ def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
                                    outer=outer_k, pos_iters=pos_iters_k, sub=sub)
         guard = generation_step(cur, (t0, t1), seeds=seeds, dx=dx,
                                 outer=outer_k, pos_iters=pos_iters_k, sub=sub)
+        null = generation_step(cur, window_k, seeds=seeds, dx=dx,
+                               outer=outer_k, pos_iters=pos_iters_k, sub=sub,
+                               force_dead=True)
         dJk = windowed["Jc"] - J
         guard_dJk = guard["Jc"] - J
+        null_dJk = null["Jc"] - J
+        paired = _paired_dJ(windowed["spread"], null["spread"])
+        corrected_dJk = paired["mean"] if paired is not None else float("nan")
+        corrected_dJk_se = paired["se"] if paired is not None else float("nan")
+        corrected_dJk_n = paired["n"] if paired is not None else 0
         if verbose:
             print(f"  gen {k}: w_k={w_k:.4f}  Jc {J:.5f} -> "
                   f"{windowed['Jc']:.5f}  dJk={dJk:+.5f}  "
                   f"(feasible={windowed['feasible']})   guard: "
                   f"{guard['Jc']:.5f}  guard_dJk={guard_dJk:+.5f}  "
-                  f"(feasible={guard['feasible']})")
+                  f"(feasible={guard['feasible']})   null_dJk={null_dJk:+.5f}  "
+                  f"(feasible={null['feasible']})   corrected_dJk="
+                  f"{corrected_dJk:+.5f} +/- {corrected_dJk_se:.5f} "
+                  f"(n={corrected_dJk_n})")
         generations.append(dict(
             k=k, w_k=w_k, window=window_k, Jc=windowed["Jc"], dJk=dJk,
             feasible=windowed["feasible"], guard_Jc=guard["Jc"],
             guard_dJk=guard_dJk, guard_feasible=guard["feasible"],
+            null_Jc=null["Jc"], null_dJk=null_dJk, null_feasible=null["feasible"],
+            corrected_dJk=corrected_dJk, corrected_dJk_se=corrected_dJk_se,
+            corrected_dJk_n=corrected_dJk_n,
             diagnostics=windowed["diagnostics"], spread=windowed["spread"],
             sol=windowed["sol"]))
         cur, J = windowed["sol"], windowed["Jc"]
@@ -575,6 +603,26 @@ def decay_ratios(generations):
     log-growth hypothesis it should not track `window_ratio` at all."""
     dJks = [g["dJk"] for g in generations]
     return [dJks[i + 1] / dJks[i] for i in range(len(dJks) - 1)]
+
+
+def corrected_decay_ratios(generations):
+    """Same as `decay_ratios` but on `corrected_dJk` (the null-control-
+    subtracted, paired-per-seed gain -- see `generation_ladder`'s
+    docstring), not raw `dJk`. This is the number Experiment 2 should
+    actually be read from: raw `dJk` is exposed to the same search-noise
+    contamination `scale_sweep` found and fixed in Experiment 1 (a
+    zero-value insertion can still move `Jc` via the multi-seed search
+    finding a better basin for the OLD kinks), so a raw decay-ratio
+    tracking `window_ratio` is not by itself evidence of real scale-
+    dependent decay. `corrected_dJk` is a plain Python float (from
+    `_paired_dJ`, unlike `dJk`'s numpy float64), so a 0/0 (both arms exactly
+    flat -- e.g. a stalled generation where neither the windowed nor the
+    null-control arm moved `Jc` at all) raises `ZeroDivisionError` in pure
+    Python instead of numpy's silent `nan`; computed via numpy here so that
+    case reports `nan` (genuinely undefined ratio) instead of crashing."""
+    dJks = np.asarray([g["corrected_dJk"] for g in generations], dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return [float(dJks[i + 1] / dJks[i]) for i in range(len(dJks) - 1)]
 
 
 def fit_geometric(dJk):

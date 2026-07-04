@@ -6,8 +6,14 @@
 ## required finding and fixing FOUR distinct methodological issues in a row
 ## (search-noise contamination, wrong statistic, a resolution floor, and a
 ## budget that didn't port from Run 9's setup) -- full history below.
-## Experiment 2 (window_ratio) has NOT had the same fixes applied yet and
-## should be read as suggestive only. Experiments 4-5 not run/built.
+## Experiment 2 (window_ratio) now has the null-control arm + paired statistic
+## too (`generation_ladder` runs a `force_dead=True` arm per generation and
+## reports `corrected_dJk`/`corrected_dJk_se`/`corrected_dJk_n`, alongside a
+## new `corrected_decay_ratios` helper) -- code implemented and RUN at the
+## driver's real seed count/budget (seeds=range(5), both bases, both
+## ratios). Result: WORSE than inconclusive -- unusable at 5 seeds, the
+## paired-feasible-overlap collapses to n=0-1 for 3 of 4 combos. See
+## "Experiment 2 rerun" section below. Experiments 4-5 not run/built.
 
 ## New finding: search-noise contamination in `generation_step` (found here,
 ## applies retroactively to Run 9 too)
@@ -329,12 +335,42 @@ after this one — see "What to run next" for the options going forward.
    10-20) on top of this is still worth doing to shrink the standard error,
    but do the statistic fix first — it's free and likely matters more than
    sample size here.
-1. **Null-correct `generation_ladder`** the same way `scale_sweep` was
-   fixed: add a `force_dead=True` guard-style third arm per generation
-   (reusing `generation_step`'s new parameter), report `null_dJk` and
-   `corrected_dJk = dJk - null_dJk`, and add a `corrected_decay_ratios`
-   helper alongside `decay_ratios`. Until this exists, Experiment 2's
-   `window_ratio` numbers (both bases, both ratios) are suggestive only.
+1. **DONE — Null-correct `generation_ladder`** the same way `scale_sweep` was
+   fixed: `generation_ladder` now runs a `force_dead=True` guard-style third
+   arm per generation (reusing `generation_step`'s new parameter), reports
+   `null_Jc`/`null_dJk`/`null_feasible` and `corrected_dJk`/
+   `corrected_dJk_se`/`corrected_dJk_n` (via `_paired_dJ`, not `dJk -
+   null_dJk` best-of-max), and there's a `corrected_decay_ratios` helper
+   alongside `decay_ratios`. Rerun caught one more bug: `corrected_dJk` is a
+   plain Python `float` (from `_paired_dJ`), so a generation where both the
+   windowed and null arm went exactly flat (`0.0/0.0`) raised
+   `ZeroDivisionError` in `corrected_decay_ratios` instead of numpy's silent
+   `nan` (which is why `decay_ratios`, built on numpy-typed `dJk`, never hit
+   this) — fixed by computing the ratio through `np.asarray`.
+
+   **Rerun result (real config: `seeds=range(5)`, both bases G0/run6, both
+   ratios 0.7/0.3) — worse than inconclusive, unusable at this seed count:**
+
+   | base | window_ratio | dJk (raw)                | decay_ratios   | corrected_dJk (n)                          | corrected_decay_ratios |
+   |------|-------------|---------------------------|----------------|---------------------------------------------|--------------------------|
+   | G0   | 0.7         | +0.094 +0.042 +0.034      | 0.449, 0.793   | -0.070(2) -0.051(2) +0.010(4)               | +0.72, -0.19             |
+   | G0   | 0.3         | +0.088 +0.004 +0.000      | 0.044, 0.041   | -0.025(1) +0.004(1) nan(0)                  | -0.15, nan               |
+   | run6 | 0.7         | +0.009 +0.000 +0.000      | 0.000, 0.000   | nan(0) +0.000(1) +0.000(1)                  | nan, nan                 |
+   | run6 | 0.3         | +0.033 +0.004 +0.000      | 0.124, 0.052   | nan(0) nan(0) nan(0)                        | nan, nan                 |
+
+   Raw `dJk`/`decay_ratios` look clean and G0/0.7 even loosely tracks its
+   own `window_ratio` (0.449, 0.793 vs 0.7) — exactly the illusion
+   Experiment 1 warned about before it was null-corrected. Once corrected,
+   the paired statistic needs a seed feasible in BOTH the windowed and null
+   arms, and that overlap collapses to `n=0-1` for 3 of the 4 combos
+   (run6/0.3 is a total washout, `n=0` at every generation). Only G0/0.7
+   keeps `n=2-4`, and even there `corrected_dJk` flips sign across
+   generations with no `window_ratio`-tracking pattern and no `se` narrow
+   enough to trust. Same root cause as Experiment 1's fix #4 (budget/seeds
+   didn't port): `scale_sweep` needed 16 seeds (up from 5) to recover
+   `n=1-10`; `generation_ladder` has not been rerun at that seed count.
+   **Until it is, Experiment 2 should not be read for a `window_ratio`
+   signal at all — not even suggestively.**
 2. **Re-read Experiment 1's `corrected_dJ(w)`** (not raw `dJ(w)`) once the
    null-corrected sweep is in hand — this is the actual answer to "does a
    single generation's real gain vanish at small scale", the raw numbers
@@ -343,6 +379,12 @@ after this one — see "What to run next" for the options going forward.
 3. Once both discriminators are null-corrected, re-apply this file's
    Experiment 4/5 gating logic (only escalate if corrected results disagree
    or stay ambiguous).
+3b. **Escalate Experiment 2's seed count** (`seeds=range(16)`, mirroring
+   Experiment 1's final config) if the `window_ratio` discriminator is
+   worth pursuing further — at `seeds=range(5)` the paired-feasible overlap
+   is too thin to read at all (see rerun result above), so this isn't
+   optional the way it might be for other experiments; without it,
+   Experiment 2 currently contributes nothing.
 4. Consider whether Run 9's original `dJk` sequences (both bases,
    `window_ratio=0.5`) are worth a retroactive null-correction pass too, or
    whether the mostly-nonzero `jump_mean` diagnostics already recorded there

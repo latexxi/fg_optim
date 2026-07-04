@@ -15,7 +15,15 @@ flow. Mirrors `plans/run9-code-plan.md`'s format.
 ## doubled outer/pos_iters budget after the first two fixes still left most
 ## sweep points' paired sample size too small (Run 9's budget didn't port to
 ## this setup). Final Experiment 1 result: INCONCLUSIVE (no significant
-## trend, everything within ~1-2 SE of zero) -- see
+## trend, everything within ~1-2 SE of zero). `generation_ladder` (Experiment
+## 2) later got the same three fixes (force_dead arm, `_paired_dJ`,
+## `corrected_decay_ratios`) plus its own bug: `corrected_dJk` is a plain
+## Python float, so a 0/0 generation raised `ZeroDivisionError` where
+## `decay_ratios`'s numpy-typed `dJk` silently gave `nan` -- fixed via
+## `np.asarray`. Rerun at the real driver config (5 seeds) found Experiment
+## 2 unusable at that seed count (paired n collapses to 0-1 for 3 of 4
+## base/window_ratio combos) -- needs the same seed escalation Experiment 1
+## needed (5 -> 16), not yet done. See
 ## `run10-scale-sweep-discriminators.md`'s findings sections for the full
 ## story of each. Details below, per piece.
 
