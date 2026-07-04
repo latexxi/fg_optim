@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d import Axes3D
 from kink_opt import run, conv_eval, report
+from kink_opt.viz import plot_heatmaps, field_grid
 
 
 def plot_surfaces(r, nx=401, figsize=(14, 5)):
@@ -37,33 +38,6 @@ def plot_surfaces(r, nx=401, figsize=(14, 5)):
     ax2.set_ylabel("t")
     ax2.set_zlabel("g(x,t)")
     ax2.set_title("g(x,t): weights function")
-
-    plt.tight_layout()
-    return fig
-
-
-def plot_heatmaps(r, nx=401, figsize=(14, 5)):
-    """Heatmaps of f(x,t) and g(x,t)."""
-    x = np.linspace(-1.0, 1.0, nx)
-    t = r["t"]
-    Np1 = len(t)
-
-    F = np.array([conv_eval(x, r["A"][k], r["XI"][k]) for k in range(Np1)])
-    G = np.array([conv_eval(x, r["B"][k], r["ETA"][k]) for k in range(Np1)])
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
-
-    im1 = ax1.contourf(x, t, F, levels=20, cmap="viridis")
-    ax1.set_xlabel("x")
-    ax1.set_ylabel("t")
-    ax1.set_title("f(x,t)")
-    plt.colorbar(im1, ax=ax1)
-
-    im2 = ax2.contourf(x, t, G, levels=20, cmap="plasma")
-    ax2.set_xlabel("x")
-    ax2.set_ylabel("t")
-    ax2.set_title("g(x,t)")
-    plt.colorbar(im2, ax=ax2)
 
     plt.tight_layout()
     return fig

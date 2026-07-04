@@ -1,4 +1,4 @@
-"""Run 1-9: narrated demos. Not a test suite -- each run's configuration and
+"""Run 1-10: narrated demos. Not a test suite -- each run's configuration and
 commentary explains what the previous run left on the table and why the next
 one's hyperparameters were chosen. See CLAUDE.md's "The __main__ block"."""
 
@@ -9,7 +9,10 @@ from .objective import total_J
 from .solver import run, multistart, _alternate
 from .verify import certify, report, n_live_nodes, graded_grid, _ub
 from .topology import (add_kink, spawn_generation, _seed_grown, prune,
-                       grow_topology, generation_ladder)
+                       grow_topology, generation_ladder, scale_sweep,
+                       decay_ratios, _gate_report, _budget_stable,
+                       generation_step)
+from .persist import save_run, save_ladder, save_sweep
 
 
 def main():
@@ -20,6 +23,8 @@ def main():
     r0 = run(N=24, Kf=1, Kg=1, outer=3, seed="static",
              optimize_pos=False, verbose=True)
     report("static 1+1", r0)
+    save_run("run1", r0, meta=dict(N=24, Kf=1, Kg=1, outer=3, seed="static",
+                                   optimize_pos=False))
 
     print()
     print("=" * 70)
@@ -27,6 +32,8 @@ def main():
     print("=" * 70)
     r1 = run(N=16, Kf=1, Kg=1, outer=6, seed="static", pos_iters=50)
     report("travel 1+1", r1)
+    save_run("run2", r1, meta=dict(N=16, Kf=1, Kg=1, outer=6, seed="static",
+                                   pos_iters=50))
 
     print()
     print("=" * 70)
@@ -34,6 +41,8 @@ def main():
     print("=" * 70)
     r2 = run(N=16, Kf=3, Kg=2, outer=40, seed="static", pos_iters=40, patience=5)
     report("static 3+2", r2)
+    save_run("run3", r2, meta=dict(N=16, Kf=3, Kg=2, outer=40, seed="static",
+                                   pos_iters=40, patience=5))
 
     print()
     print("=" * 70)
@@ -55,6 +64,10 @@ def main():
     r3 = multistart(seeds=range(6), N=16, Kf=5, Kg=4, outer=40,
                      seed="static", pos_iters=40, patience=5)
     report("multistart 5+4", r3)
+    save_run("run4", r3, meta=dict(multistart_seeds=list(range(6)), N=16,
+                                   Kf=5, Kg=4, outer=40, seed="static",
+                                   pos_iters=40, patience=5,
+                                   rng_seed=r3.get("rng_seed")))
 
     print()
     print("=" * 70)
@@ -67,6 +80,10 @@ def main():
     r4 = multistart(seeds=range(20), N=16, Kf=6, Kg=5, outer=60,
                      seed="static", pos_iters=80, patience=6)
     report("multistart 6+5", r4)
+    save_run("run5", r4, meta=dict(multistart_seeds=list(range(20)), N=16,
+                                   Kf=6, Kg=5, outer=60, seed="static",
+                                   pos_iters=80, patience=6,
+                                   rng_seed=r4.get("rng_seed")))
 
     print()
     print("=" * 70)
@@ -83,6 +100,9 @@ def main():
     grown = grow_topology(r2, n_gen=2, cand_seeds=range(2), outer=20,
                           pos_iters=40, patience=5)
     report("grown topo", grown)
+    save_run("run6", grown, meta=dict(base="run3", n_gen=2,
+                                      cand_seeds=list(range(2)), outer=20,
+                                      pos_iters=40, patience=5))
 
     print()
     print("=" * 70)
@@ -120,6 +140,9 @@ def main():
           f"({100*n_live_nodes(best_rh)//base_live}% of baseline), "
           f"J_certified = {bestJ:.4f} (seed {bestS})   "
           f"-> {'PASS' if bestJ >= bar else 'FAIL'} (within 1% at half nodes)")
+    save_run("run7a", best_rh, meta=dict(t="half", N=8, Kf=3, Kg=2, outer=40,
+                                         pos_iters=60, patience=6,
+                                         rng_seed=bestS))
 
     # Part B: a fine g-kink alive only on a narrow window W. Resolve W to 6
     # local steps two ways and count live decision variables.
@@ -152,6 +175,8 @@ def main():
     print(f"    uniform: {N_unif + 1:2d} nodes, {live_unif:3d} live vars for the "
           f"SAME local resolution ({live_unif / n_live_nodes(gcand):.1f}x more "
           f"variables; the win grows as the window narrows)")
+    save_run("run7b", gcand, meta=dict(window=W, coarse_N=10, fine_sub=6,
+                                       outer=20, pos_iters=40, patience=5))
 
     print()
     print("=" * 70)
@@ -186,7 +211,7 @@ def main():
 
     def _warm(XI2, ETA2, af2, ag2):
         """Re-optimize from the bootstrapped seed; return (coarse-J curve,
-        certified J, feasible, convergence outer-iter)."""
+        certified J, feasible, convergence outer-iter, pruned sol)."""
         A0, B0 = _seed_grown(G0, XI2, ETA2, af2, ag2)
         r = _alternate(A0, XI2, B0, ETA2, G0["t"], af2, ag2, outer=budget,
                        pos_iters=40, optimize_pos=True, verbose=False,
@@ -194,8 +219,9 @@ def main():
         curve = [jp for (_, jp) in r["hist"]]
         conv = next((i + 1 for i in range(1, len(curve))
                      if abs(curve[i] - curve[i - 1]) < 1e-5), len(curve))
-        c = certify(prune(r, 1e-8))
-        return curve, c["Jc"], c["rep"]["ALL CONSTRAINTS OK"], conv
+        pruned = prune(r, 1e-8)
+        c = certify(pruned)
+        return curve, c["Jc"], c["rep"]["ALL CONSTRAINTS OK"], conv, pruned
 
     # spawn arm: contracted copy of the finest carrier, one f + one g kink.
     # spawn places both new kinks on [0.5, 1.0] (half the all-alive lifetime,
@@ -209,9 +235,9 @@ def main():
     A_pad = np.column_stack([G0["A"], np.zeros(G0["t"].size)])
     B_pad = np.column_stack([G0["B"], np.zeros(G0["t"].size)])
     J_ins = total_J(A_pad, Xs, B_pad, Es)
-    _, spawn_Jc, spawn_ok, spawn_conv = _warm(Xs, Es, afs, ags)
+    _, spawn_Jc, spawn_ok, spawn_conv, spawn_sol = _warm(Xs, Es, afs, ags)
 
-    best_rand = (-np.inf, False, None, None)            # (Jc, ok, conv, seed)
+    best_rand = (-np.inf, False, None, None, None)  # (Jc, ok, conv, seed, sol)
     for rs in range(4):
         rr = np.random.default_rng(rs)
         Xr, Er, afr, agr = add_kink("f", G0["XI"], G0["ETA"], G0["alive_f"],
@@ -219,10 +245,10 @@ def main():
                                     dx=0.3, rng=rr)
         Xr, Er, afr, agr = add_kink("g", Xr, Er, afr, agr, pg, G0["t"],
                                     0.5, 1.0, dx=0.3, rng=rr)
-        _, jc, ok, conv = _warm(Xr, Er, afr, agr)
+        _, jc, ok, conv, sol = _warm(Xr, Er, afr, agr)
         if ok and jc > best_rand[0]:
-            best_rand = (jc, ok, conv, rs)
-    rand_Jc, rand_ok, rand_conv, rand_seed = best_rand
+            best_rand = (jc, ok, conv, rs, sol)
+    rand_Jc, rand_ok, rand_conv, rand_seed, rand_sol = best_rand
 
     print(f"  G0 (Run 3): J_certified = {J0:.4f}")
     print(f"  spawn insertion is J-neutral: J at insertion = {J_ins:.4f} "
@@ -237,6 +263,9 @@ def main():
           f"(null result: contracted copy is redundant at gen 0 -- the "
           f"hierarchy is not yet self-similar; machinery is correct and ready "
           f"for the multi-generation Section-5 test)")
+    save_run("run8_spawn", spawn_sol, meta=dict(scale_t=0.5, scale_x=0.5))
+    if rand_sol is not None:
+        save_run("run8_random", rand_sol, meta=dict(dx=0.3, seed=rand_seed))
 
     print()
     print("=" * 70)
@@ -261,6 +290,11 @@ def main():
     ladder = generation_ladder(G0, n_gen=3, window0=0.5, window_ratio=0.5,
                                seeds=range(3), outer=25, pos_iters=60,
                                coarse_N=8, base_fine_sub=4, sub=8)
+    save_ladder("run9", ladder, meta=dict(base="run3", n_gen=3, window0=0.5,
+                                          window_ratio=0.5,
+                                          seeds=list(range(3)), outer=25,
+                                          pos_iters=60, coarse_N=8,
+                                          base_fine_sub=4, sub=8))
 
     print(f"\n  {'k':>2} {'w_k':>7} {'Jc':>8} {'dJk':>8} {'ok':>5}   "
           f"{'guard_Jc':>8} {'guard_dJk':>9} {'ok':>5}")
@@ -290,6 +324,114 @@ def main():
     print("  reported per generation; the guard arm is never adopted into the")
     print("  ladder, only compared against it).")
 
+    print()
+    print("=" * 70)
+    print("Run 10 (scale-sweep discriminators): Run 9's n_gen=3 ladder showed")
+    print("  dJk decaying on two bases, but 3 points can't rule out budget")
+    print("  starvation faking decay (three separate under-convergence")
+    print("  artifacts were caught by hand producing Run 9's numbers -- see")
+    print("  plans/run9-generation-gain-ladder.md). This run decouples 'gain")
+    print("  truly vanishes at small scale' from 'optimizer starved' with two")
+    print("  experiments that both run at Run 9's already-PROVEN budget")
+    print("  (outer=40, pos_iters=100, seeds=5 @ ~41-node grids), no budget")
+    print("  escalation treadmill:")
+    print("  Experiment 1 -- dJ(w): a SINGLE generation's gain vs window scale")
+    print("    w, each point independent (own regrid, no accumulation), on")
+    print("    Run 6's grown base. A NULL-CONTROL arm (force_dead=True: the")
+    print("    new kinks are masked so the LP can NEVER give them weight) runs")
+    print("    alongside -- discovered necessary when a point with BOTH new")
+    print("    kinks at jump_mean=0 (dead at convergence) still showed nonzero")
+    print("    dJ: the insertion jitter alone perturbs the OLD kinks onto a")
+    print("    different local optimum via the multi-seed search, independent")
+    print("    of any real value the new kink provides. corrected_dJ = dJ -")
+    print("    null_dJ subtracts that search-noise floor. corrected_dJ(w) ->")
+    print("    nonzero const as w->0 supports log-growth; ->0 supports bounded.")
+    print("  Experiment 2 -- window_ratio discriminator: rerun the n_gen=3")
+    print("    ladder at window_ratio 0.7 and 0.3 on both bases (G0, grown).")
+    print("    Under 'J bounded, dJ ~ w', decay_ratios should track")
+    print("    window_ratio; under log-growth it should not.")
+    print("  Experiment 3 -- cheap gate (_gate_report: feasible seeds + real")
+    print("    kink activity) on every point, plus a doubled-budget bookend")
+    print("    check (_budget_stable) at the sweep's narrowest window, the")
+    print("    single point most exposed to starvation.")
+    print("  See plans/run10-scale-sweep-discriminators.md for the full")
+    print("  design and plans/run10-code-plan.md for the implementation.")
+    print("=" * 70)
+
+    print("\n  -- Experiment 1: dJ(w) on Run 6's grown base --")
+    print("  (paired per-seed statistic, 16 seeds, outer=80/pos_iters=200 --")
+    print("  a first pass at 5 seeds/outer=40 with best-of-max subtraction")
+    print("  came back with no discernible trend and 3/6 points negative")
+    print("  (fixed via _paired_dJ); a second pass at 16 seeds/outer=40 then")
+    print("  showed windowed-arm feasibility as low as 6/16 at w=0.5 and both")
+    print("  arms collapsing to near-identical values (no real search")
+    print("  diversity) at w=0.0625 -- Run 9's outer=40/pos_iters=100 budget,")
+    print("  proven adequate for ITS ladder setup, does not port to")
+    print("  scale_sweep's single-window regrid. Doubled here; see")
+    print("  plans/run10-scale-sweep-discriminators.md for the full history)")
+    ws10 = [0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]
+    seeds10 = range(16)
+    sweep = scale_sweep(grown, ws10, seeds=seeds10, outer=80, pos_iters=200,
+                        sub=8, verbose=False)
+    print(f"  base_Jc = {sweep['base_Jc']:.5f}")
+    print(f"  {'w':>9} {'nodes':>6} {'dJ':>9} {'ok':>5} {'gate':>6}   "
+          f"{'corrected_dJ':>12} {'+/- se':>8} {'n':>3}   {'guard_dJ':>9} {'ok':>5}")
+    for p in sweep["points"]:
+        g = _gate_report(p)
+        print(f"  {p['w']:>9.5f} {p['n_nodes']:>6} {p['dJ']:>+9.5f} "
+              f"{str(p['feasible']):>5} {str(g['ready']):>6}   "
+              f"{p['corrected_dJ_mean']:>+12.5f} {p['corrected_dJ_se']:>8.5f} "
+              f"{p['corrected_dJ_n']:>3}   "
+              f"{p['guard_dJ']:>+9.5f} {str(p['guard_feasible']):>5}")
+    save_sweep("run10_sweep_run6base", sweep,
+              meta=dict(base="run6", ws=ws10, seeds=list(seeds10),
+                        outer=80, pos_iters=200, sub=8))
+
+    narrowest = sweep["points"][-1]
+    bookend = _budget_stable(generation_step, narrowest["sol"],
+                             (1.0 - ws10[-1], 1.0), seeds=range(5),
+                             outer=80, pos_iters=200, sub=8)
+    print(f"  bookend check @ narrowest w={ws10[-1]}: budget-doubled dJ moved "
+          f"by {bookend['delta']:+.5f}  (stable={bookend['accepted']})")
+
+    print("\n  -- Experiment 2: window_ratio discriminator --")
+    ratio_runs = []
+    for base_name, base_sol in (("G0", G0), ("run6", grown)):
+        for wr in (0.7, 0.3):
+            lad = generation_ladder(base_sol, n_gen=3, window0=0.5,
+                                    window_ratio=wr, seeds=range(5), outer=40,
+                                    pos_iters=100, coarse_N=8, base_fine_sub=4,
+                                    sub=8, verbose=False)
+            dr = decay_ratios(lad["generations"])
+            dJks10 = [g["dJk"] for g in lad["generations"]]
+            print(f"  base={base_name:5s} window_ratio={wr:.1f}  "
+                  f"dJk={[f'{d:+.4f}' for d in dJks10]}  "
+                  f"decay_ratios={[f'{r:.3f}' for r in dr]}")
+            save_ladder(f"run10_ratio_{base_name}_{wr}", lad,
+                       meta=dict(base=base_name, n_gen=3, window0=0.5,
+                                window_ratio=wr, seeds=list(range(5)),
+                                outer=40, pos_iters=100, coarse_N=8,
+                                base_fine_sub=4, sub=8))
+            ratio_runs.append((base_name, wr, dr))
+
+    print("\n  Reading: if Experiment 1's corrected_dJ(w) trends to zero as w")
+    print("  shrinks, and Experiment 2's decay_ratios cluster near their own")
+    print("  window_ratio (0.7-ish for the wr=0.7 runs, 0.3-ish for wr=0.3),")
+    print("  both point at 'J bounded, log growth was a discretization")
+    print("  transient'. A flat corrected_dJ(w) or ratio-independent decay")
+    print("  would overturn that reading. IMPORTANT CAVEAT: Experiment 2's")
+    print("  dJk above has NOT been null-corrected (generation_ladder doesn't")
+    print("  run a force_dead arm yet) -- given Experiment 1's finding that")
+    print("  search-noise alone can rival or exceed the real windowed dJ, the")
+    print("  window_ratio numbers should be read as suggestive, not settled,")
+    print("  until a null-corrected ladder is run. See")
+    print("  run10-scale-sweep-discriminators.md Experiments 4 (falsifiable")
+    print("  gen4 extrapolation) and 5 (constructive arm) for what to run")
+    print("  next -- not run automatically here since Experiment 4 needs an")
+    print("  escalating per-generation budget (compounding cost) and")
+    print("  Experiment 5 is exploratory math, not yet implemented")
+    print("  (kink_opt/construct.py).")
+
     # EXT: adaptive per-kink time nodes (fine generations live fast & short)
     # EXT: warm-start next generation from a rescaled copy of this solution
     # EXT: multistart currently reseeds from scratch per attempt; a real
@@ -298,6 +440,11 @@ def main():
     #      Run 5's Kf=7,8 exploration shows this can pick an infeasible
     #      "winner" once K is large enough that the position NLP struggles;
     #      a feasibility-aware selection would be more robust at high K
+    # EXT: Run 10 Experiment 4 (falsifiable dJk4 extrapolation via
+    #      fit_geometric + generation_ladder(budget_fn=...)) and Experiment 5
+    #      (kink_opt/construct.py constructive arm) -- see
+    #      plans/run10-scale-sweep-discriminators.md, run only if Run 10's
+    #      two discriminators above come back ambiguous or disagree.
 
 
 if __name__ == "__main__":

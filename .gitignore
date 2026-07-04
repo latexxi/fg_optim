@@ -6,3 +6,6 @@ surfaces.png
 heatmaps.png
 slices.png
 kink_trajectories.png
+
+# saved run outputs (regenerable via `python3 -m kink_opt`)
+results/

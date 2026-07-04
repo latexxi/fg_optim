@@ -164,7 +164,7 @@ def prune(r, tol=1e-8):
 
 
 def generation_step(cur, window, seeds=range(3), dx=0.05, outer=12,
-                    pos_iters=40, patience=None, sub=8):
+                    pos_iters=40, patience=None, sub=8, force_dead=False):
     """One rung of the Run 9 generation-gain ladder (STRATEGY.md Section 5):
     insert ONE new f-kink and ONE new g-kink, both alive only on `window` =
     (t_birth, t_death), as perturbed copies of the current most-active kink
@@ -179,6 +179,22 @@ def generation_step(cur, window, seeds=range(3), dx=0.05, outer=12,
     Passing `window = (t[0], t[-1])` (full lifetime) turns this into the
     "guard arm" (a free, unrestricted insertion) -- same code path, since
     windowed-vs-free is just this one argument.
+
+    `force_dead=True` turns this into the Run 10 NULL-CONTROL arm: both new
+    columns' alive masks are forced all-False right after insertion, so the
+    LP can NEVER give them weight, no matter what `window`/seed says. This
+    isolates a real contamination discovered while running Run 10's
+    scale_sweep: even a new kink that ends up with jump_mean=0 (dead at
+    convergence) can still leave `Jc` measurably higher than the pre-insertion
+    base, because the insertion jitter changes the L-BFGS-B starting vector
+    (and interacts with the GAP spacing penalty against same-family kinks
+    while alive during early outer iterations), which perturbs the OLD
+    kinks onto a different -- sometimes better -- local optimum via the
+    multi-seed search, independent of any real value the new kink provides.
+    `force_dead=True` reruns the identical seeded search with that channel
+    open but the new-kink-value channel closed, so `Jc_dead - Jc_before`
+    measures pure search-noise; subtracting it from a real run's `dJ` is the
+    control-corrected signal. See plans/run10-scale-sweep-discriminators.md.
 
     Column identity: the new kink is appended as the LAST column of its
     family (`cur["XI"].shape[1]` / `cur["ETA"].shape[1]` before insertion).
@@ -207,6 +223,9 @@ def generation_step(cur, window, seeds=range(3), dx=0.05, outer=12,
             pf, t, tb, td, dx=dx, rng=rng)
         XI2, ETA2, af2, ag2 = add_kink(
             "g", XI2, ETA2, af2, ag2, pg, t, tb, td, dx=dx, rng=rng)
+        if force_dead:
+            af2[:, new_f_idx] = False
+            ag2[:, new_g_idx] = False
         A0, B0 = _seed_grown(cur, XI2, ETA2, af2, ag2)
         cand = _alternate(A0, XI2, B0, ETA2, t, af2, ag2, outer=outer,
                           pos_iters=pos_iters, optimize_pos=True,
@@ -227,9 +246,59 @@ def generation_step(cur, window, seeds=range(3), dx=0.05, outer=12,
                 spread=[(r["seed"], r["Jc"], r["feasible"]) for r in results])
 
 
+def _regrid_onto_windows(cur, windows, fine_subs, coarse_N=8, sub=8,
+                         tol_rel=0.01, verbose=True):
+    """Migrate a converged solution `cur` onto a graded grid built around
+    `windows` (Task C), and verify the migration is J-neutral. Shared by
+    `generation_ladder` (one regrid up front for the whole ladder) and
+    `scale_sweep` (one fresh regrid per sweep point, Run 10 Experiment 1).
+
+    The regrid is a strict REFINEMENT of `cur`'s own nodes, never a
+    coarsening: `graded_grid`'s own uniform background (`coarse_N`) can be
+    coarser than `cur["t"]` outside the windows, which would silently lose
+    resolution there (a real bug caught once in Run 9 -- see
+    plans/run9-code-plan.md). Union with `cur["t"]` guarantees every
+    original node survives.
+
+    Weights are re-solved (exact LP repair) on the new grid to restore
+    feasibility; positions/weights are otherwise linearly interpolated.
+    Checked against `certify(cur)` before returning -- raises past
+    `tol_rel` relative gap, since a silent large mismatch would corrupt
+    every downstream dJ.
+
+    Returns (cur_regridded, regrid_Jc)."""
+    base_Jc = certify(cur, sub=sub)["Jc"]
+    t0, t1 = cur["t"][0], cur["t"][-1]
+    grid = graded_grid(windows, coarse_N=coarse_N, fine_sub=fine_subs,
+                       t0=t0, t1=t1)
+    t_new = np.union1d(grid, cur["t"])
+
+    A2 = _interp_to_grid(cur["A"], cur["t"], t_new)
+    XI2 = _interp_to_grid(cur["XI"], cur["t"], t_new)
+    B2 = _interp_to_grid(cur["B"], cur["t"], t_new)
+    ETA2 = _interp_to_grid(cur["ETA"], cur["t"], t_new)
+    alive_f2 = np.ones((len(t_new), XI2.shape[1]), dtype=bool)
+    alive_g2 = np.ones((len(t_new), ETA2.shape[1]), dtype=bool)
+    A2 = lp_weights_f(XI2, B2, ETA2, ub=_ub(alive_f2))   # restore exact
+    B2 = lp_weights_g(A2, XI2, ETA2, ub=_ub(alive_g2))   # feasibility
+    out = dict(A=A2, XI=XI2, B=B2, ETA=ETA2, t=t_new, J=total_J(A2, XI2, B2, ETA2),
+              hist=[], alive_f=alive_f2, alive_g=alive_g2)
+    regrid_Jc = certify(out, sub=sub)["Jc"]
+    if verbose:
+        print(f"  base J_certified = {base_Jc:.5f}  ->  regridded onto "
+              f"{len(t_new)} nodes, J_certified = {regrid_Jc:.5f}")
+    if abs(regrid_Jc - base_Jc) > tol_rel * abs(base_Jc):
+        raise RuntimeError(
+            f"regrid is not within {tol_rel:.0%} of base: base {base_Jc:.5f} "
+            f"vs regridded {regrid_Jc:.5f} -- fix the migration before "
+            f"trusting any dJ")
+    return out, regrid_Jc
+
+
 def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
                       seeds=range(3), dx=0.05, base_fine_sub=4, coarse_N=8,
-                      outer=12, pos_iters=40, sub=8, verbose=True):
+                      outer=12, pos_iters=40, sub=8, budget_fn=None,
+                      verbose=True):
     """Run 9 driver -- the STRATEGY.md Section 5 generation-gain measurement.
     Starting from a converged `base` solution (Run 3's G0 in the driver
     below), births one windowed generation at a time via `generation_step`
@@ -267,53 +336,40 @@ def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
     only and is never adopted, so this can't quietly degrade into the
     unrestricted growth of Runs 4-5.
 
+    `budget_fn(k, n_live)`, if given, overrides the flat `outer`/`pos_iters`
+    per generation (`n_live = cur["XI"].shape[1] + cur["ETA"].shape[1]`,
+    the accumulated kink count going INTO generation k) -> `(outer_k,
+    pos_iters_k)`. Default `None` reproduces the flat-budget behaviour
+    exactly (Run 9's n_gen=5 escalation-needed case -- see
+    plans/run9-generation-gain-ladder.md -- is what this exists for: the
+    position-NLP dimensionality grows with accumulated kink count across the
+    ladder, and a flat per-ladder budget silently starves later generations).
+
     Returns dict(generations=[dict(k, w_k, window, Jc, dJk, feasible,
-    guard_Jc, guard_dJk, guard_feasible, diagnostics, spread), ...],
+    guard_Jc, guard_dJk, guard_feasible, diagnostics, spread, sol), ...],
     base_Jc)."""
     cur = prune(base, tol=1e-8)
-    base_Jc = certify(cur, sub=sub)["Jc"]
-
     t0, t1 = cur["t"][0], cur["t"][-1]
     ws = [window0 * window_ratio**(k - 1) for k in range(1, n_gen + 1)]
     windows = [(t1 - w, t1) for w in ws]
     fine_subs = [base_fine_sub * window0 / w for w in ws]
-    grid = graded_grid(windows, coarse_N=coarse_N, fine_sub=fine_subs,
-                       t0=t0, t1=t1)
-    # A regridding must be a strict REFINEMENT of `base`'s own nodes, never a
-    # coarsening -- graded_grid's own uniform background (`coarse_N`) may be
-    # coarser than base's original grid outside the windows, which would
-    # silently lose resolution there and corrupt every downstream dJk. Union
-    # with cur["t"] guarantees every original node survives.
-    t_new = np.union1d(grid, cur["t"])
-
-    A2 = _interp_to_grid(cur["A"], cur["t"], t_new)
-    XI2 = _interp_to_grid(cur["XI"], cur["t"], t_new)
-    B2 = _interp_to_grid(cur["B"], cur["t"], t_new)
-    ETA2 = _interp_to_grid(cur["ETA"], cur["t"], t_new)
-    alive_f2 = np.ones((len(t_new), XI2.shape[1]), dtype=bool)
-    alive_g2 = np.ones((len(t_new), ETA2.shape[1]), dtype=bool)
-    A2 = lp_weights_f(XI2, B2, ETA2, ub=_ub(alive_f2))   # restore exact
-    B2 = lp_weights_g(A2, XI2, ETA2, ub=_ub(alive_g2))   # feasibility
-    cur = dict(A=A2, XI=XI2, B=B2, ETA=ETA2, t=t_new, J=total_J(A2, XI2, B2, ETA2),
-              hist=[], alive_f=alive_f2, alive_g=alive_g2)
-    regrid_Jc = certify(cur, sub=sub)["Jc"]
-    if verbose:
-        print(f"  base J_certified = {base_Jc:.5f}  ->  regridded onto "
-              f"{len(t_new)} nodes, J_certified = {regrid_Jc:.5f}")
-    if abs(regrid_Jc - base_Jc) > 0.01 * abs(base_Jc):
-        raise RuntimeError(
-            f"regrid is not within 1% of base: base {base_Jc:.5f} vs "
-            f"regridded {regrid_Jc:.5f} -- fix the migration before "
-            f"trusting any dJk")
+    cur, regrid_Jc = _regrid_onto_windows(cur, windows, fine_subs,
+                                          coarse_N=coarse_N, sub=sub,
+                                          verbose=verbose)
 
     generations = []
     J = regrid_Jc
     for k in range(1, n_gen + 1):
         w_k, window_k = ws[k - 1], windows[k - 1]
+        if budget_fn is not None:
+            n_live = cur["XI"].shape[1] + cur["ETA"].shape[1]
+            outer_k, pos_iters_k = budget_fn(k, n_live)
+        else:
+            outer_k, pos_iters_k = outer, pos_iters
         windowed = generation_step(cur, window_k, seeds=seeds, dx=dx,
-                                   outer=outer, pos_iters=pos_iters, sub=sub)
+                                   outer=outer_k, pos_iters=pos_iters_k, sub=sub)
         guard = generation_step(cur, (t0, t1), seeds=seeds, dx=dx,
-                                outer=outer, pos_iters=pos_iters, sub=sub)
+                                outer=outer_k, pos_iters=pos_iters_k, sub=sub)
         dJk = windowed["Jc"] - J
         guard_dJk = guard["Jc"] - J
         if verbose:
@@ -326,9 +382,218 @@ def generation_ladder(base, n_gen=4, window0=0.5, window_ratio=0.5,
             k=k, w_k=w_k, window=window_k, Jc=windowed["Jc"], dJk=dJk,
             feasible=windowed["feasible"], guard_Jc=guard["Jc"],
             guard_dJk=guard_dJk, guard_feasible=guard["feasible"],
-            diagnostics=windowed["diagnostics"], spread=windowed["spread"]))
+            diagnostics=windowed["diagnostics"], spread=windowed["spread"],
+            sol=windowed["sol"]))
         cur, J = windowed["sol"], windowed["Jc"]
     return dict(generations=generations, base_Jc=regrid_Jc)
+
+
+def _paired_dJ(spread_a, spread_b):
+    """Paired per-seed difference of two `generation_step` `spread` lists
+    (list of (seed, Jc, feasible)), matched by seed value, restricted to
+    seeds feasible in BOTH arms. This is the statistically correct way to
+    compare two noisy arms sharing the same seed set -- much of the
+    search-path randomness up to the point the two arms diverge (e.g. the
+    windowed vs null-control alive mask) is common to both, so it cancels in
+    the per-seed subtraction, unlike subtracting two independently-computed
+    best-of-max values (each a high-variance order statistic; see Run 10's
+    "corrected_dJ came back inconclusive" finding in
+    plans/run10-scale-sweep-discriminators.md).
+
+    Returns None if no seed is feasible in both arms, else
+    dict(mean, se, n, per_seed=[(seed, diff), ...]) where `diff = a - b` for
+    each common feasible seed, `se` is the standard error of the mean
+    (NaN if n==1)."""
+    a = {s: jc for s, jc, ok in spread_a if ok}
+    b = {s: jc for s, jc, ok in spread_b if ok}
+    common = sorted(set(a) & set(b))
+    if not common:
+        return None
+    diffs = np.array([a[s] - b[s] for s in common])
+    se = float(diffs.std(ddof=1) / np.sqrt(diffs.size)) if diffs.size > 1 else float("nan")
+    return dict(mean=float(diffs.mean()), se=se, n=int(diffs.size),
+               per_seed=list(zip(common, diffs.tolist())))
+
+
+def scale_sweep(base, ws, seeds=range(5), dx=0.05, base_fine_sub=4,
+                coarse_N=8, outer=40, pos_iters=100, sub=8, verbose=True):
+    """Run 10 Experiment 1 -- single-generation gain vs window scale, decoupled
+    from the ladder's accumulation confounds (kink count, shared grid size --
+    see plans/run9-generation-gain-ladder.md's n_gen=5 budget-escalation
+    trail and plans/run10-scale-sweep-discriminators.md). For each `w` in
+    `ws`, independently: regrid `base` fresh around window = (t1-w, t1)
+    (`_regrid_onto_windows`, one window only, so problem size stays in the
+    same class at every point -- one verified budget covers the whole
+    sweep), then run ONE `generation_step` (windowed), ONE guard-arm
+    `generation_step` (full lifetime), and ONE NULL-CONTROL arm
+    (`force_dead=True` -- see `generation_step`'s docstring) from that
+    regridded base. No state carries between points -- each `w` measures the
+    gain of adding a single generation directly to `base`, not to the
+    previous point's result.
+
+    `fine_sub` is scaled per point as `base_fine_sub * max(ws) / w` (same
+    formula `generation_ladder` uses, anchored here at the sweep's own widest
+    window rather than a separate `window0`), NOT held at a flat
+    `base_fine_sub` for every `w`. An earlier version used a flat value,
+    which silently hit `graded_grid`'s "at least 2 local sub-intervals" floor
+    for every `w <= 0.0625` in the default sweep (3 nodes spanning the whole
+    window) -- a real, independent under-resolution confound on top of the
+    search-noise one below, caught only by checking `graded_grid`'s node-count
+    formula directly against the sweep's `ws`, not by any run-time symptom.
+    Points at or below that floor cannot show real kink development
+    regardless of the true window-scale answer; scaling `fine_sub` keeps
+    local resolution (subintervals per window) roughly constant across `ws`,
+    same as the ladder already does.
+
+    The null-control arm exists because the windowed/guard `dJ` alone is
+    contaminated: a new kink that ends up with `jump_mean=0` (dead at
+    convergence) can still leave `Jc` measurably higher than the regridded
+    base, purely because the insertion jitter perturbs the position NLP's
+    starting point / GAP-penalty landscape enough to move the OLD kinks to a
+    different local optimum via the multi-seed search -- independent of any
+    real value the new kink provides.
+
+    The comparison uses `_paired_dJ` (per-seed differencing, matched by seed
+    value between the windowed and null-control `spread`s), NOT
+    `windowed["Jc"] - null["Jc"]` (subtracting two independent best-of-max
+    values). A first version of this function did the latter and produced
+    numbers with no discernible trend and 3/6 points negative -- diagnosed
+    as best-of-max being a high-variance order statistic unsuited to
+    comparing two noisy arms sharing the same seed set; the shared search
+    randomness up to the point the two arms' alive masks diverge mostly
+    cancels in a per-seed subtraction, which best-of-max, throws away. See
+    plans/run10-scale-sweep-discriminators.md's "Corrected Experiment 1
+    results ... INCONCLUSIVE" section for the full diagnosis.
+
+    `corrected_dJ_mean(w)` (and its standard error `corrected_dJ_se`) roughly
+    constant, and clearly nonzero relative to its SE, as w -> 0 supports the
+    log-growth conjecture; trending to (and consistent with) 0 supports J
+    bounded. Report the SE alongside the mean -- a mean near zero with a
+    large SE is "inconclusive," not "no gain."
+
+    Returns dict(points=[dict(w, n_nodes, dJ, feasible, guard_dJ,
+    guard_feasible, null_dJ, null_feasible, corrected_dJ_mean,
+    corrected_dJ_se, corrected_dJ_n, diagnostics, spread, sol), ...],
+    base_Jc)."""
+    base = prune(base, tol=1e-8)
+    base_Jc = certify(base, sub=sub)["Jc"]
+    t0, t1 = base["t"][0], base["t"][-1]
+    w_ref = max(ws)
+
+    points = []
+    for w in ws:
+        window = (t1 - w, t1)
+        fine_sub_w = base_fine_sub * w_ref / w
+        cur, regrid_Jc = _regrid_onto_windows(
+            base, [window], [fine_sub_w], coarse_N=coarse_N, sub=sub,
+            verbose=False)
+        windowed = generation_step(cur, window, seeds=seeds, dx=dx,
+                                   outer=outer, pos_iters=pos_iters, sub=sub)
+        guard = generation_step(cur, (t0, t1), seeds=seeds, dx=dx,
+                                outer=outer, pos_iters=pos_iters, sub=sub)
+        null = generation_step(cur, window, seeds=seeds, dx=dx,
+                               outer=outer, pos_iters=pos_iters, sub=sub,
+                               force_dead=True)
+        dJ = windowed["Jc"] - regrid_Jc
+        guard_dJ = guard["Jc"] - regrid_Jc
+        null_dJ = null["Jc"] - regrid_Jc
+        paired = _paired_dJ(windowed["spread"], null["spread"])
+        corrected_mean = paired["mean"] if paired is not None else float("nan")
+        corrected_se = paired["se"] if paired is not None else float("nan")
+        corrected_n = paired["n"] if paired is not None else 0
+        if verbose:
+            print(f"  w={w:.5f}  ({len(cur['t'])} nodes)  regrid_Jc="
+                  f"{regrid_Jc:.5f}  dJ={dJ:+.5f} (feasible={windowed['feasible']})"
+                  f"   guard_dJ={guard_dJ:+.5f} (feasible={guard['feasible']})"
+                  f"   null_dJ={null_dJ:+.5f} (feasible={null['feasible']})"
+                  f"   corrected_dJ={corrected_mean:+.5f} +/- {corrected_se:.5f} "
+                  f"(n={corrected_n})")
+        points.append(dict(
+            w=w, n_nodes=len(cur["t"]), dJ=dJ, feasible=windowed["feasible"],
+            guard_dJ=guard_dJ, guard_feasible=guard["feasible"],
+            null_dJ=null_dJ, null_feasible=null["feasible"],
+            corrected_dJ_mean=corrected_mean, corrected_dJ_se=corrected_se,
+            corrected_dJ_n=corrected_n,
+            diagnostics=windowed["diagnostics"], spread=windowed["spread"],
+            sol=windowed["sol"]))
+    return dict(points=points, base_Jc=base_Jc)
+
+
+def _budget_stable(step_fn, *args, outer, pos_iters, factor=2.0,
+                   tol_rel=0.10, tol_abs=0.005, **kwargs):
+    """Run 10 Experiment 3 -- budget-adequacy gate. Calls `step_fn(*args,
+    outer=outer, pos_iters=pos_iters, **kwargs)`, then again at
+    `outer*factor`/`pos_iters*factor`; accepts the point only if Jc barely
+    moves between the two, i.e. the lower budget was already adequate. This
+    is the automated version of the by-hand check that caught three separate
+    under-convergence artifacts in Run 9 (see
+    plans/run9-generation-gain-ladder.md) -- a point that fails this should
+    not be read as "gain is truly absent", only as "optimizer didn't
+    converge here".
+
+    `step_fn` is `generation_step` (or anything with the same `outer=`/
+    `pos_iters=` kwargs and a `Jc` key in its return dict).
+
+    Returns dict(accepted, delta, result) -- `result` is always the
+    HIGHER-budget run (so a rejected point can still be inspected/reused),
+    `delta = Jc_hi - Jc_lo`."""
+    lo = step_fn(*args, outer=outer, pos_iters=pos_iters, **kwargs)
+    hi = step_fn(*args, outer=int(round(outer * factor)),
+                pos_iters=int(round(pos_iters * factor)), **kwargs)
+    delta = hi["Jc"] - lo["Jc"]
+    accepted = abs(delta) < max(tol_abs, tol_rel * abs(lo["Jc"]))
+    return dict(accepted=accepted, delta=delta, result=hi)
+
+
+def _gate_report(point):
+    """Cheap (no rerun) budget-adequacy signal for one `generation_step` /
+    `scale_sweep` point result, from fields it already returns: majority of
+    seeds feasible, and both new kinks show real activity (`jump_mean > 0`,
+    not starved to zero weight -- the specific failure signature Run 9 hit
+    at n_gen=5). Does not replace `_budget_stable`, only screens which points
+    are worth the expensive doubled rerun.
+
+    `point` needs `spread` (list of (seed, Jc, feasible)) and `diagnostics`
+    (dict(f=..., g=...) from `_kink_diagnostics`) -- both present on
+    `generation_step`'s return dict and on each `scale_sweep`/
+    `generation_ladder` point/generation.
+
+    Returns dict(feasible_ok, jump_ok, ready)."""
+    feasible_frac = np.mean([ok for _, _, ok in point["spread"]])
+    feasible_ok = feasible_frac >= 0.5
+    jump_ok = (point["diagnostics"]["f"]["jump_mean"] > 0 and
+              point["diagnostics"]["g"]["jump_mean"] > 0)
+    return dict(feasible_ok=bool(feasible_ok), jump_ok=bool(jump_ok),
+               ready=bool(feasible_ok and jump_ok))
+
+
+def decay_ratios(generations):
+    """dJk[i+1] / dJk[i] for consecutive generations of a `generation_ladder`
+    result -- Run 10 Experiment 2 (window_ratio discriminator). Under the
+    bounded-J hypothesis (dJ roughly proportional to window scale w), this
+    sequence should cluster near the ladder's own `window_ratio`; under the
+    log-growth hypothesis it should not track `window_ratio` at all."""
+    dJks = [g["dJk"] for g in generations]
+    return [dJks[i + 1] / dJks[i] for i in range(len(dJks) - 1)]
+
+
+def fit_geometric(dJk):
+    """Least-squares geometric fit dJk[k] ~= dJ1_fit * r**(k-1) (Run 10
+    Experiment 4, only needed if Experiments 1-2 come back ambiguous).
+    Fits in log-space (ordinary least squares on log(dJk) vs k). Raises
+    ValueError on any non-positive entry -- a sign flip or zero already
+    means the geometric-decay hypothesis this fit assumes doesn't apply, so
+    silently fitting through it would misreport the extrapolation.
+
+    Returns (r, dJ1_fit)."""
+    dJk = np.asarray(dJk, float)
+    if dJk.size < 2:
+        raise ValueError("need at least 2 points to fit a ratio")
+    if np.any(dJk <= 0):
+        raise ValueError("fit_geometric requires all dJk > 0")
+    k = np.arange(1, dJk.size + 1)
+    slope, intercept = np.polyfit(k, np.log(dJk), 1)
+    return float(np.exp(slope)), float(np.exp(intercept + slope))
 
 
 def grow_topology(base, n_gen=2, cand_seeds=range(2), dx=0.05, windows=None,
