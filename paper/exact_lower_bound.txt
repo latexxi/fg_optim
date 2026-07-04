@@ -1,0 +1,11 @@
+THEOREM (exact arithmetic).  sup J >= 3.0552.
+
+Witness: k=6 dyadic-mesh optimum, repaired (eps=1/1000000) to exact feasibility.
+Grid: 65 x-nodes x 257 t-nodes.  g step-in-t, f pw-linear.
+Exact feasibility violations: 0.
+
+J = 495748403191937564416657549941713018177701221/162259276829213363391578010288128000000000000
+  = 3.055285422686430
+
+Every convexity / Lipschitz / monotonicity / boundary constraint verified as an
+exact rational (in)equality; J is the exact continuous objective of the witness.
