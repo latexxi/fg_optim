@@ -526,14 +526,29 @@ chosen by hand), or (b) a regime where channel 2 genuinely binds (a child that i
 rise-limited, not just slope-limited) so `δ̂*` can respond to `r` and the sweep
 tests something beyond geometry alone.
 
-**Task 05 (A1/A2 sufficiency probes) has not been run.** Per its own task file and
-the primer's §0.5, the verdict above is conditional on (A1) `E` being a sufficient
-statistic for the parent's residue and (A2) the `ρ/r` rescaling being the right
-normalization — neither is independently checked yet. Combined with the geometric-
-only caveat above, the honest summary is: **the sweep is internally consistent and
-monotone as designed, but is not yet evidence for where the real problem's
-boundedness question lands** — it is a validated instrument, not yet a pinned
-answer.
+**Task 05 (A1/A2 sufficiency probes) — run, results below.**
+`probe_e_sufficiency`/`probe_rho_rescaling_sensitivity` in `kink_opt/cell.py`.
+- **A1 (E sufficient?):** the task file's literal recipe (same seed, `outer` doubled)
+  is **degenerate** here — `_alternate_injected` converges in ~1-2 iterations, so
+  `outer=40` vs `80` gives bit-identical states (`env_gap=0`, a vacuous pass). Replaced
+  with a genuine internal perturbation (a small constant carrier-offset jitter,
+  `xi_jit=2e-4`, giving a different converged `Jc` 0.1759 vs 0.1757). Real result:
+  `env_gap=6.06e-4` (< `tol_env=1e-3`, environments genuinely match) yet
+  `delta_gap=1.65e-5` (≪ `5e-3`), **`ok=True`**. Supports E-sufficiency at this
+  operating point — but only against *one* perturbation direction; does not exclude a
+  missing coordinate (drift velocity, D2 signed slope) that this jitter doesn't excite.
+- **A2 (ρ/r-convention robust?):** `δ_star` identical across convention factors
+  `{0.8, 1.0, 1.25}` at both `r=0.5` and `r=0.65`. **This is the trivial/inert outcome,
+  not evidence the convention is right:** per the channel-2-inert finding above, `ρ` is
+  never binding for `r<1`, so nothing scaled on `ρ` can move the answer. A2 is
+  uninformative until a rise-binding regime exists. A1 is the meaningful probe of the two.
+
+Combined honest summary: **the sweep is internally consistent and monotone as
+designed, A1 supports E-sufficiency at this point, but the verdict is still geometric
+(δ_star r-invariant, channel 2 inert) — a validated instrument, not yet a pinned
+answer for the real problem.** The unblocking next step is not in this task set: pin
+the *physical* `r` from an optimizer-driven contraction (`construct.py`/`melt.py`), or
+construct a rise-limited regime where channel 2 binds so `δ_star` can respond to `r`.
 
 ---
 

@@ -179,14 +179,20 @@ def cell_step(env, r, coarse_N=8, outer=40, sub=8):
                 constraints_ok=res["constraints_ok"], sol=res["sol"])
 
 
-def fixed_point(r, n_iter=12, tol=1e-4, coarse_N=8, outer=40, sub=8):
-    """Iterate E_{n+1} = CELL(E_n) at fixed frame contraction r, from the flat
-    seed, to a fixed point. Returns dict(deltas, dists, envs, converged, r).
+def fixed_point(r, n_iter=12, tol=1e-4, coarse_N=8, outer=40, sub=8, seed=None):
+    """Iterate E_{n+1} = CELL(E_n) at fixed frame contraction r, from `seed`
+    (default: flat_env()), to a fixed point. Returns dict(deltas, dists, envs,
+    converged, r).
       deltas[n]  = delta_hat of step n (certified per-cell harvest)
       dists[n]   = cell_env_distance(env_in, env_out) at step n
       converged  = True if dists[-1] < tol
-    Stops early once dists < tol."""
-    env = dict(flat_env())            # copy; do not mutate the module seed
+    Stops early once dists < tol.
+
+    `seed=None` reproduces the original flat_env()-seeded behavior exactly
+    (tasks 03/04 depend on this). `seed=` lets task 05's probes inject a
+    custom starting environment (a perturbed carrier / rescaling convention)
+    without duplicating the iteration loop."""
+    env = dict(flat_env()) if seed is None else dict(seed)  # copy; never mutate the input
     env["r"] = float(r)               # iterate at the tested frame contraction
     deltas, dists, envs = [], [], [env]
     for _ in range(n_iter):
@@ -258,6 +264,100 @@ def cell_sweep(rs, n_iter=12, tol=1e-4, **kw):
                         gamma_geom=tg["gamma_geom"],
                         gamma_emp_last=float(gamma_emp_last),
                         verdict=_verdict(fp, tg)))
+    return out
+
+
+def _unit_carrier_jittered(coarse_N=8, xi_jit=0.0, eta_jit=0.0):
+    """Like _unit_carrier, but with an extra constant offset added to each
+    family's trajectory -- the "differ internally" knob for probe_e_sufficiency.
+    Does not modify _unit_carrier (task 01-04 code); a small local variant."""
+    t = np.linspace(0.0, 1.0, coarse_N + 1)
+    p = _travel_path(t)
+    XI = np.clip(p + XI_OFFSET + xi_jit, -1 + MARGIN, 1 - MARGIN)[:, None]
+    ETA = np.clip(p + ETA_OFFSET + eta_jit, -1 + MARGIN, 1 - MARGIN)[:, None]
+    return t, XI, ETA
+
+
+def _cell_solve_jittered(env, xi_jit=0.0, eta_jit=0.0, coarse_N=8, outer=40, sub=8):
+    """Like cell_solve, but seeded from _unit_carrier_jittered instead of
+    _unit_carrier -- gives probe_e_sufficiency a second cell that is genuinely
+    internally different (different kink trajectory) while still able to read
+    off a matching E. Mirrors cell_solve's body exactly aside from the seed."""
+    t, XI, ETA = _unit_carrier_jittered(coarse_N, xi_jit, eta_jit)
+    lip_rhs, rise_cap = env_to_lp(env, t.size)
+    A, B = _alternate_injected(XI, ETA, lip_rhs, rise_cap, outer=outer)
+    sol = dict(A=A, XI=XI, B=B, ETA=ETA, t=t,
+               alive_f=np.ones_like(XI, bool), alive_g=np.ones_like(ETA, bool))
+    c = certify(sol, sub=sub, lip_rhs=lip_rhs, rise_cap=rise_cap)
+    return dict(J=total_J(A, XI, B, ETA), Jc=c["Jc"],
+                constraints_ok=bool(c["rep"]["ALL CONSTRAINTS OK"]), sol=sol)
+
+
+def probe_e_sufficiency(r=0.5, tol_env=1e-3, xi_jit=2e-4, eta_jit=-1.5e-4, **kw):
+    """A1 (plans/run13/05-sufficiency-probes.md): is E a sufficient statistic?
+    Build two solved cells that agree in their read-off E to tight tolerance
+    but differ internally, then check whether their *next-step* delta_hat
+    also agrees. If it doesn't, E is missing a coordinate (first candidate:
+    parent's local drift velocity at handoff) and no fixed point of CELL
+    means anything on its own.
+
+    NOTE on the "differ internally" recipe: the task doc's suggested variant
+    (same flat seed, reached with 2x `outer`) was tried first and found
+    degenerate here -- _alternate_injected's convex block-alternation already
+    converges (J stops improving past 1e-9) in ~1-2 outer iterations for this
+    carrier, so outer=40 vs outer=80 produces BIT-IDENTICAL internal states,
+    not just matching E (env_gap=0, delta_gap=0 -- a vacuous pass). Instead
+    this perturbs the carrier's spatial offset by a small constant jitter
+    (xi_jit/eta_jit), which does converge to a genuinely different internal
+    solution (different Jc, not bit-identical) while still reading off an E
+    within tol_env of the unperturbed cell's -- a real test of the recipe's
+    intent.
+
+    Returns dict(env_gap, delta_a, delta_b, delta_gap, ok)."""
+    a = cell_step(dict(flat_env(), r=r), r=r, **kw)
+    b_solved = _cell_solve_jittered(dict(flat_env(), r=r), xi_jit=xi_jit,
+                                     eta_jit=eta_jit,
+                                     coarse_N=kw.get("coarse_N", 8),
+                                     outer=kw.get("outer", 40),
+                                     sub=kw.get("sub", 8))
+    b = dict(delta_hat=b_solved["Jc"], env_out=cell_read_env(b_solved["sol"], r=r),
+              constraints_ok=b_solved["constraints_ok"], sol=b_solved["sol"])
+    env_gap = cell_env_distance(a["env_out"], b["env_out"])
+    # step once more from each and compare the harvest
+    da = cell_step(a["env_out"], r=r, **kw)["delta_hat"]
+    db = cell_step(b["env_out"], r=r, **kw)["delta_hat"]
+    delta_gap = abs(da - db)
+    return dict(env_gap=float(env_gap), delta_a=float(da), delta_b=float(db),
+                delta_gap=float(delta_gap),
+                ok=bool(env_gap < tol_env and delta_gap < 5e-3))
+
+
+def probe_rho_rescaling_sensitivity(r=0.5, factors=(0.8, 1.0, 1.25), **kw):
+    """A2 (plans/run13/05-sufficiency-probes.md): is the verdict robust to the
+    rho/r normalization *convention*, as opposed to r itself (already swept by
+    task 04)? Re-runs fixed_point from a seed whose rho is pre-scaled by an
+    extra convention factor and reports the converged delta_star per factor.
+
+    CAVEAT (carried over from task 03's finding): the converged delta_star is
+    bit-identical across all r<1 because env_to_lp's channel-2 rise cap
+    rho/r only LOOSENS for r<1 -- channel 2 never binds, channel 1 (the
+    arm-only slope cap) drives everything. So a flat table here (converged
+    True/True/True, delta_star constant across factors) is the EXPECTED,
+    TRIVIAL outcome in this regime, not evidence the ρ/r convention is
+    robustly correct -- it is evidence channel 2 is inert. This probe would
+    only be informative at an r (or a construction) where the rise-budget
+    channel actually binds; as run here it is a much weaker check than A1.
+
+    Returns list of dict(factor, converged, delta_star)."""
+    out = []
+    for fac in factors:
+        seed = dict(flat_env())
+        seed["r"] = r
+        seed["rho"] = seed["rho"] * fac
+        fp = fixed_point(r, seed=seed, **kw)
+        tg = tiling_gain(fp["deltas"], r)
+        out.append(dict(factor=float(fac), converged=fp["converged"],
+                         delta_star=tg["delta_star"]))
     return out
 
 
