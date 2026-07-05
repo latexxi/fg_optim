@@ -484,7 +484,26 @@ of the implementation plan) is implemented but not run at scale — a single
 `n_gen=4, K=8` point is estimated at low tens of seconds and a full grid at
 tens of minutes, and is the natural next step if this is pursued further.
 
+**Status (Run 13, in progress — `plans/run13-selfreproducing-cell.md`, branch
+`run13-cell`).** The methodological upgrade over Runs 9-12: stop simulating the
+growing global cascade (whose depth-4 ceiling reproduces the two-data-point
+weakness) and instead iterate a **unit-frame cell** `CELL: E ↦ (δ̂, E′)` at O(1)
+cost per octave, reading the boundedness verdict `γ` at a *fixed point* of that
+transfer operator — not at any generation-0 optimum. `kink_opt/cell.py` implements
+the `E ↦ δ̂` half (two LP injection channels — residual slope slack via `lip_rhs`,
+residual rise budget via `rise_cap` — plus `certify` passthrough and a flat-E
+no-op gate; all pass). Remaining: the `E′` read-off, `ρ/r` rescaling, `2^k` tiling
+multiply, and the `E → CELL(E)` fixed-point loop (that is where the verdict is
+decided). Banked unconditionally along the way: an **exact-arithmetic** certificate
+`sup J ≥ 3.0552` (`paper/exact_lower_bound.py`, 0 feasibility violations, exact
+rational J), independent of the γ story.
+
 ## 6. Files
+
+> **CLAUDE.md is the authoritative, current file list for the `kink_opt/` package.**
+> The inventory below predates the Run 11-13 additions (`construct.py`, `melt.py`,
+> `cell.py`, `persist.py`, `viz.py`) and the Run 13 LP-injection kwargs on
+> `lp.py`/`verify.py`; read CLAUDE.md for those.
 
 The prototype was originally one file (`kink_opt.py`); it was split into a
 `kink_opt/` package by dependency layer (verified byte-identical Run 1-9

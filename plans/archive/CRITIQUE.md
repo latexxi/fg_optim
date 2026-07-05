@@ -1,3 +1,7 @@
+> **ARCHIVED — FOLDED INTO `plans/run13-selfreproducing-cell.md`.** This critique's
+> substance is now in the active plan (see its §15 honesty ledger, §6 corrected
+> decision band, §2 wrong-target argument). Kept for provenance only.
+
 # Whacking Run 13
 
 ## What's genuinely strong

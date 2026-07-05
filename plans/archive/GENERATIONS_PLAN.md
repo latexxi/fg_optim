@@ -1,3 +1,6 @@
+> **ARCHIVED — FOLDED INTO `plans/run13-selfreproducing-cell.md`** as its conceptual
+> companion (the same induction, informal). Kept for provenance only.
+
 Here is the whole cascade as one inductive idea. It's self-contained — you only need the setup from the note (maximize `∫∫ fₜ g_xx`; `f` rises and `g` falls in time; both convex in `x` with slopes capped at ±1; the two end-tents fixed).
 
 ## The one mechanism (what every generation does)

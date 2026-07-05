@@ -1,9 +1,10 @@
 # Run 13 — The self-reproducing cell (the number that repeats)
 
-**Supersedes the *aim* of `plans/GEN0.md`** (its math is reused; its goal — a
+**Supersedes the *aim* of `plans/archive/GEN0.md`** (its math is reused; its goal — a
 generation-0 *optimizer* — is the wrong target, §2). **Conceptual companion:**
-`GENERATIONS_PLAN.md` (the same induction, informal). **This revision folds in
-`CRITIQUE.md`:** the central construction is now the **unit-frame cell solver**
+`plans/archive/GENERATIONS_PLAN.md` (the same induction, informal). **This revision folds in
+`plans/archive/CRITIQUE.md`** (all three now archived — folded into this plan)**:**
+the central construction is now the **unit-frame cell solver**
 (§4), not a global-hierarchy simulation; the decision band is corrected (γ near 1 is
 *inconclusive both ways*, §6); an **exact-arithmetic stage** funds the word "proof"
 (§7); **E-sufficiency and ρ-rescaling** are named as load-bearing assumptions to

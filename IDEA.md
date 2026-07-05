@@ -1,5 +1,10 @@
 # Ideas
 
+> **REFERENCE — foundational idea scratchpad, still current.** The framing here (harvest
+> accounting, travel-beats-static, the log-growth / renormalization question) is the seed
+> of the whole project. Developed forms: `STRATEGY.md` (briefing) and
+> `plans/run13-selfreproducing-cell.md` (the active RG-cell plan).
+
 ## Core problem framing
 
 Maximize a coupled functional J[f,g] over two constrained space-time

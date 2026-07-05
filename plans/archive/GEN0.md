@@ -1,3 +1,7 @@
+> **ARCHIVED — AIM SUPERSEDED by `plans/run13-selfreproducing-cell.md` §2** (a
+> generation-0 *optimizer* is the wrong target). The **math** here (curvature-measure
+> coordinate §2) is still live: run13 §1 reuses it verbatim. Kept as the coordinate spec.
+
 # Optimizing generation 0 — formulation and parameterized construction
 
 Goal: pin down *exactly* what "generation 0" is, in coordinates an optimizer can move in,
