@@ -293,7 +293,7 @@ unvalidated at k=0* — which is itself a finding (see Section 5 caveat).
 
 ---
 
-## 5. The experiment that everything serves  [RUNNING — machinery done (Run 9), first result INCONCLUSIVE at n_gen=3]
+## 5. The experiment that everything serves  [Run 9 INCONCLUSIVE, Run 10 INCONCLUSIVE, Run 11 (constructive) BOUNDED, Run 12 (melt-band) also BOUNDED — see status update at end of section]
 
 **Protocol (generation-gain measurement):**
 
@@ -394,6 +394,95 @@ either way on sup J. Next steps (more generations, more seeds, reading the
 already-collected per-generation diagnostics for a self-similarity signal,
 and possibly a different/deeper base if guard keeps winning) are tracked in
 `plans/run9-generation-gain-ladder.md`.
+
+**Status (Run 10).** Two discriminators built to decouple "gain vanishes" from
+"optimizer starved" (`plans/run10-scale-sweep-discriminators.md`): a single-
+generation `dJ(w)` scale sweep (Experiment 1) and a rerun of the `n_gen=3`
+ladder at `window_ratio` 0.7/0.3 (Experiment 2). Both needed real methodology
+fixes (search-noise contamination from the insertion-jitter multistart moving
+*old* kinks to a better basin even when the new kink dies; best-of-max instead
+of a paired per-seed statistic; a resolution floor; a budget that didn't port)
+before either could be trusted at all. Even after all fixes: Experiment 1's
+`corrected_dJ(w)` sits within ~1-2 SE of zero at every scale, no trend either
+direction — genuinely INCONCLUSIVE, not a null. Experiment 2 is worse: at
+5 seeds the paired statistic's seed-overlap collapses to n=0-1 for 3 of 4
+(base, ratio) combos — unusable, not even suggestive. Root cause, diagnosed
+only after both experiments: **a local-search optimizer can fail to find
+gain, but can never certify gain absent, and can never prove blowup** — the
+route is dead-ended structurally, not at budget.
+
+**Status (Run 11) — the constructive arm, the only PROVE-side path.**
+`kink_opt/construct.py` (`plans/run11-constructive-hierarchy.md`) sidesteps
+the optimizer entirely: kink positions are set ANALYTICALLY (an affine-
+contracted copy of a travelling gen-0 carrier, anchored at the shared
+travel-path end, exactly the contraction formula `spawn_generation` already
+implements, but stacked and jitter-free), so the only numerical solve left is
+the convex weight LP — zero position NLP anywhere, hence zero of the Run
+9/10 budget-artifact failure class. `constructive_ladder` certifies
+generations 0..n_gen and reports `dJk` deterministically: no seeds, no null
+arm, no paired statistic needed (nothing here is a search).
+
+Result at `scale_t=scale_x=0.5`, `n_gen=4`: `dJk` = `+0.1065, +0.0203,
++0.0062, ~0.0000` — decaying FASTER than a geometric fit to the first three
+points predicts (falsifiable prediction: fitted ratio `r=0.241` predicts
+`dJ_4≈+0.0014`; actual is `~0`). Swept across 9 `(scale_t, scale_x)`
+combinations, every one collapses `dJk` by 1-2 orders of magnitude within 3
+generations; none shows the roughly-constant `dJk` the log-growth conjecture
+predicts, and the decay ratio does not cleanly track either `scale_t` or
+`scale_x` alone. `saturation_diagnostics` shows part of the mechanism is
+structural: every generation is anchored at the SAME point `(p_end, t1)`, so
+deep generations collapse toward one location — the same "two hats at one
+point are redundant" mechanism Run 8 found at k=0, now emerging from the
+anchoring choice itself at every k.
+
+**Reading: this is the first PROOF-quality evidence in this file** (not
+merely search-consistent) — and it says bounded J, decisively, for this
+specific shared-endpoint self-similar anchoring. It does not by itself rule
+out a hierarchy whose generations keep moving to genuinely new (non-
+collapsing) locations instead of converging to one point; a construction
+with a different anchoring scheme would be needed to test that, and is the
+only thing left open on this question. See
+`plans/run11-constructive-hierarchy.md` for the full validation checks
+(insertion-neutrality, grid-convergence, travel-sanity — all PASS) and the
+complete sweep table.
+
+**Status (Run 12) — a second, non-collapsing anchoring, same conclusion.**
+`kink_opt/melt.py` (`plans/run12-renormalization-cell.md`,
+`plans/run12-implementation-details.md`) tests whether Run 11's bounded
+result was an artifact of ITS specific collapsing anchor (every generation
+contracting toward one shared point) by building an ansatz that doesn't
+collapse spatially: each generation is a BAND of `K=8` kinks per family
+riding a drift path of ABSOLUTE length `L` that does NOT shrink with depth
+(only the band's width and window duration shrink, geometrically). Still
+zero position NLP, LP-only weight alternation.
+
+Two implementation findings surfaced before any number could be trusted
+(both are instructive on their own — see `kink_opt/melt.py`'s
+`build_melt_hierarchy` docstring and CLAUDE.md's Run 12 section for the
+full mechanism): the plan's originally-specified "boundary stock" (a static
+hat at `x=0`) turned out to structurally saturate the ENTIRE per-node
+Lipschitz budget by itself (its coefficients are the worst-case `1/(1±0)=1`
+on both constraints at once), driving every other column to exactly zero —
+dropped; and the weight-LP alternation needed to be seeded INCREMENTALLY
+(generation-by-generation, mirroring `add_kink`'s bootstrap) rather than
+with one flat ramp over the whole structure at once, since `J` is only
+bilinear (not jointly convex) in `(A,B)` and a flat seed at this larger
+column count (`K=8` vs Run 11's 1 kink/generation) is measurably more
+exposed to a worse fixed point.
+
+Result at `lambda_w=lambda_s=0.5, L=0.3, K=8, n_gen=3`: `dJk` = `+0.1866,
++0.0098, +0.0053` — collapsing about as fast as Run 11's did, and landing
+~2 orders of magnitude below the mesh's own +0.215/octave. **Reading: a
+non-shrinking drift length alone does not rescue log-growth** — this
+ansatz still centers every generation's window on the SAME point in time
+and space (the recursive-midpoint anchoring collapses to one constant
+regardless of depth), so a different collapse mechanism (temporal/spatial
+co-centering, not Run 11's spatial contraction) still dominates. Two
+independently-anchored constructions now agree: bounded `J`. The
+`(lambda_w, lambda_s, L)` fixed-point sweep (`fixed_point_sweep`, Stage 4
+of the implementation plan) is implemented but not run at scale — a single
+`n_gen=4, K=8` point is estimated at low tens of seconds and a full grid at
+tens of minutes, and is the natural next step if this is pursued further.
 
 ## 6. Files
 
