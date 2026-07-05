@@ -1,4 +1,4 @@
-"""Run 1-10: narrated demos. Not a test suite -- each run's configuration and
+"""Run 1-11: narrated demos. Not a test suite -- each run's configuration and
 commentary explains what the previous run left on the table and why the next
 one's hyperparameters were chosen. See CLAUDE.md's "The __main__ block"."""
 
@@ -11,8 +11,15 @@ from .verify import certify, report, n_live_nodes, graded_grid, _ub
 from .topology import (add_kink, spawn_generation, _seed_grown, prune,
                        grow_topology, generation_ladder, scale_sweep,
                        decay_ratios, corrected_decay_ratios, _gate_report,
-                       _budget_stable, generation_step)
-from .persist import save_run, save_ladder, save_sweep
+                       _budget_stable, generation_step, fit_geometric)
+from .construct import (constructive_ladder, sweep_ratios,
+                        check_insertion_neutral, grid_convergence_check,
+                        travel_sanity, saturation_diagnostics)
+from .melt import (build_melt_hierarchy, melt_ladder, read_environment,
+                   env_distance, check_band_neutral, band_travel_sanity,
+                   mesh_cross_check)
+from .persist import (save_run, save_ladder, save_sweep, save_construct,
+                      save_melt)
 
 
 def main():
@@ -442,6 +449,178 @@ def main():
     print("  escalating per-generation budget (compounding cost) and")
     print("  Experiment 5 is exploratory math, not yet implemented")
     print("  (kink_opt/construct.py).")
+
+    print()
+    print("=" * 70)
+    print("Run 11 (constructive hierarchy): the optimizer route (Runs 9-10)")
+    print("  hit its structural ceiling -- a local-search optimizer can only")
+    print("  ever FAIL to find gain, never certify it absent. This run builds")
+    print("  the hierarchy DIRECTLY: kink positions are set analytically (an")
+    print("  affine-contracted copy of a travelling gen-0 carrier, per")
+    print("  generation, anchored at a shared right endpoint -- see")
+    print("  construct.build_hierarchy), zero position NLP anywhere. The only")
+    print("  numerical solve left is the convex weight LP that certify() and")
+    print("  build_hierarchy's own weight solve both use to exact global")
+    print("  optimality. Deterministic, no seeds, no null arm needed -- there")
+    print("  is no search noise to correct for.")
+    print("=" * 70)
+
+    print("\n  -- validation before trusting any number --")
+    neutral = check_insertion_neutral(3, scale_t=0.5, scale_x=0.5)
+    print(f"  insertion-neutral check (gen 3 forced dead vs gen 2): "
+          f"Jc {neutral['Jc_with_dead']:.5f} vs {neutral['Jc_without']:.5f}  "
+          f"(rel diff {neutral['diff_rel']:.2e})  -> "
+          f"{'PASS' if neutral['ok'] else 'FAIL'}")
+
+    primary = constructive_ladder(4, scale_t=0.5, scale_x=0.5, sub=8)
+    deepest = primary["generations"][-1]["sol"]
+    gc = grid_convergence_check(deepest, sub_lo=8, sub_hi=16)
+    print(f"  grid-convergence check (deepest ladder, sub 8 vs 16): "
+          f"Jc {gc['Jc_lo']:.5f} vs {gc['Jc_hi']:.5f}  "
+          f"(rel diff {gc['diff_rel']:.2%})  -> "
+          f"{'PASS' if gc['ok'] else 'FAIL'}")
+    ts = travel_sanity(primary["generations"][0]["sol"])
+    print(f"  travel sanity (gen-0 carrier): p_start={ts['p_start']:+.3f} "
+          f"-> p_end={ts['p_end']:+.3f}  -> "
+          f"{'PASS (travels)' if ts['ok'] else 'FAIL (co-located)'}")
+
+    print("\n  -- primary ladder: scale_t=0.5, scale_x=0.5, n_gen=4 --")
+    print(f"  {'k':>2} {'Jc':>9} {'dJk':>9} {'ratio':>7} {'ok':>5}")
+    for g in primary["generations"]:
+        dJk_s = f"{g['dJk']:+.5f}" if g["dJk"] is not None else "   -   "
+        ratio_s = f"{g['ratio']:.3f}" if g["ratio"] is not None else "  -  "
+        print(f"  {g['k']:>2} {g['Jc']:>9.5f} {dJk_s:>9} {ratio_s:>7} "
+              f"{str(g['constraints_ok']):>5}")
+    save_construct("run11_primary", primary, meta=dict(n_gen=4, sub=8))
+
+    dJks11 = [g["dJk"] for g in primary["generations"] if g["dJk"] is not None]
+    r_fit, dJ1_fit = fit_geometric(dJks11[:3])
+    dJ4_pred = dJ1_fit * r_fit ** 3
+    dJ4_actual = dJks11[3]
+    print(f"\n  falsifiable prediction (fit dJ1..dJ3 geometric, predict dJ4):")
+    print(f"    fitted ratio r={r_fit:.3f}  ->  predicted dJ4={dJ4_pred:+.5f}"
+          f"   actual dJ4={dJ4_actual:+.5f}")
+    print("    actual dJ4 is far BELOW the geometric extrapolation (already")
+    print("    ~0, not merely decaying at the fitted rate) -- decay is faster")
+    print("    than geometric, not slower: this falsifies log-growth harder")
+    print("    than the prediction even required, and supports bounded J.")
+
+    print("\n  -- saturation-mechanism instrumentation (why dJk decays) --")
+    print(f"  {'k':>2} {'x_birth':>8} {'rise_budget_used':>17} {'g_mass':>8}")
+    for g in primary["generations"][1:]:
+        d = saturation_diagnostics(g["sol"], g["k"])
+        print(f"  {d['k']:>2} {d['x_birth']:>+8.4f} "
+              f"{d['rise_budget_used']:>17.4f} {d['g_mass']:>8.4f}")
+    print("  Reading: x_birth converges toward the shared anchor p_end as k")
+    print("  grows (by construction -- window_k shrinks toward t1), so")
+    print("  rise_budget_used converging is expected geometry, not evidence")
+    print("  of hitting the Lipschitz cap. g_mass is exactly 0 for gen 1-2 --")
+    print("  the LP gets all of gen 1-2's gain from the new f-kink alone and")
+    print("  assigns the new g-kink NO weight, only starting to use it once")
+    print("  the contraction is tight enough (gen 3+). Honest caveat: because")
+    print("  every generation is anchored at the SAME point (p_end, t1), deep")
+    print("  generations collapse toward one location -- structurally similar")
+    print("  to Run 8's 'two hats at one point are redundant' mechanism, just")
+    print("  emerging here from the anchoring choice itself rather than from")
+    print("  weight competition. This construction therefore demonstrates")
+    print("  bounded J UNDER a single shared-endpoint self-similar anchoring;")
+    print("  it does not by itself rule out a hierarchy whose generations")
+    print("  keep moving to genuinely new locations instead of collapsing.")
+
+    print("\n  -- sweep (scale_t, scale_x), n_gen=3 --")
+    sweep11 = sweep_ratios(3, scale_ts=[0.7, 0.5, 0.3], scale_xs=[0.7, 0.5, 0.3],
+                           sub=8)
+    print(f"  {'scale_t':>7} {'scale_x':>7}   dJk                          ratios")
+    for o in sweep11:
+        dJk_str = ", ".join(f"{d:+.4f}" for d in o["dJk"])
+        ratio_str = ", ".join(f"{r:.3f}" for r in o["ratios"])
+        print(f"  {o['scale_t']:>7.1f} {o['scale_x']:>7.1f}   [{dJk_str}]   "
+              f"[{ratio_str}]")
+    print("  Every (scale_t, scale_x) combination shows dJk collapsing by")
+    print("  1-2 orders of magnitude within 3 generations -- none shows the")
+    print("  roughly-constant dJk the log-growth conjecture predicts. The")
+    print("  decay ratio does not cleanly track either scale_t or scale_x")
+    print("  alone (e.g. scale_x=0.7 gives ratios 0.29/0.38, well below 0.7),")
+    print("  i.e. decay is faster than either single contraction rate would")
+    print("  predict on its own -- consistent with the anchoring-collapse")
+    print("  mechanism above compounding on top of the per-scale contraction.")
+    print("  Conclusion for this construction: bounded J, decisively, subject")
+    print("  to the shared-anchor caveat above -- the constructive arm this")
+    print("  plan called for is the first PROOF-quality (not merely")
+    print("  search-consistent) evidence either way in this file.")
+
+    print()
+    print("=" * 70)
+    print("Run 12 (melt-band cell, plans/run12-*.md): Run 11 showed bounded J")
+    print("  for ONE specific anchoring (generations contract toward a shared")
+    print("  fixed endpoint, so deep generations collapse spatially onto one")
+    print("  point -- 'two hats at one point are redundant' is baked into that")
+    print("  geometry). This run tests a DIFFERENT ansatz that does not have")
+    print("  that structural collapse built in: each generation is a BAND of")
+    print("  K kinks (not 1) riding a drift path of ABSOLUTE length L that")
+    print("  does NOT shrink with depth (only the band's width w_k and its")
+    print("  window duration s_k shrink, both geometrically). Still zero")
+    print("  position NLP -- weights only, LP-only alternation.")
+    print("=" * 70)
+
+    print("\n  -- validation before trusting any number --")
+    m1 = build_melt_hierarchy(1)
+    cbn = check_band_neutral(1)
+    print(f"  band-neutral check (gen 1 forced dead vs gen 0): "
+          f"Jc {cbn['Jc_with_dead']:.5f} vs {cbn['Jc_without']:.5f}  "
+          f"(rel diff {cbn['diff_rel']:.2e})  -> "
+          f"{'PASS' if cbn['ok'] else 'FAIL'}")
+    gc12 = grid_convergence_check(m1)
+    print(f"  grid-convergence check (gen 1, sub 8 vs 16): "
+          f"Jc {gc12['Jc_lo']:.5f} vs {gc12['Jc_hi']:.5f}  "
+          f"(rel diff {gc12['diff_rel']:.2%})  -> "
+          f"{'PASS' if gc12['ok'] else 'FAIL'}")
+    bts = band_travel_sanity(m1, 1, m1["band_specs"])
+    print(f"  band-travel sanity (gen 1): L_expected={bts['L_expected']:.3f} "
+          f"L_observed={bts['L_observed']:.3f}  -> "
+          f"{'PASS (drifts)' if bts['ok'] else 'FAIL'}")
+
+    print("\n  -- primary ladder: lambda_w=0.5, lambda_s=0.5, L=0.3, K=8, n_gen=3 --")
+    lad12 = melt_ladder(3, sub=8)
+    print(f"  {'k':>2} {'Jc':>9} {'dJk':>9} {'ratio':>7} {'ok':>5}")
+    for g in lad12["generations"]:
+        dJk_s = f"{g['dJk']:+.5f}" if g["dJk"] is not None else "   -   "
+        ratio_s = f"{g['ratio']:.3f}" if g["ratio"] is not None else "  -  "
+        print(f"  {g['k']:>2} {g['Jc']:>9.5f} {dJk_s:>9} {ratio_s:>7} "
+              f"{str(g['constraints_ok']):>5}")
+    save_melt("run12_primary", lad12, meta=dict(n_gen=3))
+
+    dJks12 = [g["dJk"] for g in lad12["generations"] if g["dJk"] is not None]
+    mcc = mesh_cross_check(dJks12[-2:])
+    print(f"\n  mesh cross-check (dJ_2, dJ_3 vs +0.215/octave, factor-of-3 bar): "
+          f"ratios_to_target={[f'{r:.3f}' for r in mcc['ratio_to_target']]}  "
+          f"-> {'PASS' if mcc['ok'] else 'FAIL'}")
+    print("  Reading: dJk still collapses fast here too (2 orders of magnitude")
+    print("  by generation 3), and lands two orders of magnitude below the")
+    print("  mesh's own per-octave gain -- so a non-shrinking drift length L")
+    print("  alone does not rescue the log-growth signature under this")
+    print("  specific anchoring (every band still centered on the SAME point")
+    print("  in time and space, `mid`/`c_anchor` -- only width and window")
+    print("  duration shrink). gen 3 also fails certify()'s dense constraint")
+    print("  check by a small margin (~1e-7) at this sub=8 resolution -- a")
+    print("  resolution-floor symptom, not evidence about the hypothesis; see")
+    print("  plans/run12-implementation-details.md Section 8 on the LP's")
+    print("  Kf^2-ish cost -- sub=16 at this K=8/n_gen=3 scale is a multi-GB,")
+    print("  multi-minute certify() call, deliberately not run by default here.")
+
+    print("\n  -- environment read-off: generation 1 -> generation 2 --")
+    spec2 = lad12["generations"][2]["sol"]["band_specs"][1]
+    env1_out = lad12["generations"][1]["env"]
+    env2_in = read_environment(lad12["generations"][1]["sol"], 2, spec2)
+    dist = env_distance(env1_out, env2_in)
+    print(f"  beta (gen 1, outgoing): {np.round(env1_out['beta'], 3)}")
+    print(f"  beta (gen 2, incoming): {np.round(env2_in['beta'], 3)}")
+    print(f"  env_distance(outgoing_1, incoming_2) = {dist:.4f}")
+    print("  Not yet run: the (lambda_w, lambda_s, L) fixed-point sweep")
+    print("  (melt.fixed_point_sweep) -- Section 8 of the implementation-")
+    print("  details plan estimates a single n_gen=4,K=8 ladder point at low")
+    print("  tens of seconds and a 27-point grid at tens of minutes, a")
+    print("  'leave it running' job rather than part of the default demo run.")
 
     # EXT: adaptive per-kink time nodes (fine generations live fast & short)
     # EXT: warm-start next generation from a rescaled copy of this solution

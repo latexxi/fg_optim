@@ -126,6 +126,94 @@ def load_ladder(tag, root="results"):
     return dict(generations=generations, base_Jc=info.pop("base_Jc"), meta=info)
 
 
+def save_construct(tag, ladder, meta=None, root="results", nx=401):
+    """Save a `construct.constructive_ladder()` result under results/<tag>/:
+      results/<tag>/gen{k}/sol.npz, fields.png -- full solution + heatmap at
+                                                   generation k (k=0 is the
+                                                   gen-0 carrier alone)
+      results/<tag>/construct.json             -- {scale_t, scale_x,
+                                                    generations, meta}
+    (generations[] entries have "sol" stripped -- it lives in gen{k}/sol.npz),
+    same layout convention as save_ladder's gen{k}/."""
+    d = Path(root) / tag
+    d.mkdir(parents=True, exist_ok=True)
+    generations = []
+    for g in ladder["generations"]:
+        k = g["k"]
+        gd = d / f"gen{k}"
+        gd.mkdir(parents=True, exist_ok=True)
+        save_sol(gd / "sol", g["sol"], nx=nx)
+        save_figure(gd / "fields", g["sol"], nx=nx)
+        generations.append(_jsonable({key: v for key, v in g.items() if key != "sol"}))
+    info = dict(tag=tag, timestamp=datetime.now(timezone.utc).isoformat(),
+                git_sha=_git_sha(), scale_t=ladder["scale_t"],
+                scale_x=ladder["scale_x"], generations=generations,
+                **(meta or {}))
+    (d / "construct.json").write_text(json.dumps(_jsonable(info), indent=2))
+
+
+def load_construct(tag, root="results"):
+    """-> dict(generations=[...], scale_t=..., scale_x=..., meta=...),
+    structurally the same as `constructive_ladder()`'s return (each
+    generation dict regains its "sol" key, loaded from gen{k}/sol.npz)."""
+    d = Path(root) / tag
+    info = json.loads((d / "construct.json").read_text())
+    generations = info.pop("generations")
+    for g in generations:
+        g["sol"] = load_sol(d / f"gen{g['k']}" / "sol")
+    return dict(generations=generations, scale_t=info.pop("scale_t"),
+               scale_x=info.pop("scale_x"), meta=info)
+
+
+def save_melt(tag, ladder, meta=None, root="results", nx=401):
+    """Save a `melt.melt_ladder()` result under results/<tag>/:
+      results/<tag>/gen{k}/sol.npz, fields.png -- full solution + heatmap at
+                                                   generation k (k=0 is the
+                                                   coarse carrier alone)
+      results/<tag>/melt.json                  -- {lambda_w, lambda_s, L, K,
+                                                    generations, meta}
+    (generations[] entries have "sol" and the sol's "band_specs" stripped --
+    `band_specs` carries live callables (`c`), which aren't JSON/npz-able and
+    are cheap to recompute from lambda_w/lambda_s/L/K/t0/t1/w0/s0 if ever
+    needed; `env`'s beta/rho arrays ARE kept, JSON-encodable via `_jsonable`
+    same as everywhere else), same layout convention as save_construct's
+    gen{k}/."""
+    d = Path(root) / tag
+    d.mkdir(parents=True, exist_ok=True)
+    generations = []
+    for g in ladder["generations"]:
+        k = g["k"]
+        gd = d / f"gen{k}"
+        gd.mkdir(parents=True, exist_ok=True)
+        sol = g["sol"]
+        save_sol(gd / "sol", sol, nx=nx)
+        save_figure(gd / "fields", sol, nx=nx)
+        generations.append(_jsonable({key: v for key, v in g.items()
+                                      if key not in ("sol",)}))
+    info = dict(tag=tag, timestamp=datetime.now(timezone.utc).isoformat(),
+                git_sha=_git_sha(), lambda_w=ladder["lambda_w"],
+                lambda_s=ladder["lambda_s"], L=ladder["L"], K=ladder["K"],
+                generations=generations, **(meta or {}))
+    (d / "melt.json").write_text(json.dumps(_jsonable(info), indent=2))
+
+
+def load_melt(tag, root="results"):
+    """-> dict(generations=[...], lambda_w=..., lambda_s=..., L=..., K=...,
+    meta=...), structurally the same as `melt_ladder()`'s return (each
+    generation dict regains its "sol" key, loaded from gen{k}/sol.npz;
+    "band_specs" is NOT restored onto the loaded sol -- recompute via
+    `build_melt_hierarchy` with the saved lambda_w/lambda_s/L/K if needed,
+    e.g. for `read_environment`/`band_travel_sanity`)."""
+    d = Path(root) / tag
+    info = json.loads((d / "melt.json").read_text())
+    generations = info.pop("generations")
+    for g in generations:
+        g["sol"] = load_sol(d / f"gen{g['k']}" / "sol")
+    return dict(generations=generations, lambda_w=info.pop("lambda_w"),
+               lambda_s=info.pop("lambda_s"), L=info.pop("L"),
+               K=info.pop("K"), meta=info)
+
+
 def save_sweep(tag, sweep, meta=None, root="results", nx=401):
     """Save a scale_sweep() result (Run 10 Experiment 1) under
     results/<tag>/:

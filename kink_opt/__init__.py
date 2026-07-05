@@ -54,7 +54,13 @@ Package layout
     solver     -- _alternate, run, multistart (the block-coordinate driver)
     topology   -- add_kink, prune, spawn_generation, grow_topology,
                   generation_ladder (Task B/D + the Run 9 measurement)
-    demos      -- the narrated Run 1-9 __main__ sequence
+    construct  -- build_hierarchy, constructive_ladder (Run 11 -- the
+                  constructive, optimizer-free self-similar hierarchy)
+    melt       -- build_melt_hierarchy, melt_ladder (Run 12 -- the melt-band
+                  cell construction: K kinks per generation riding a
+                  non-shrinking drift length L, plus the environment
+                  read-off/fixed-point machinery)
+    demos      -- the narrated Run 1-12 __main__ sequence
 """
 
 from .geometry import MARGIN, GAP, PEN_W, hat_matrix, conv_eval
@@ -66,6 +72,12 @@ from .verify import (refine_time, graded_grid, n_live_nodes, verify_dense,
 from .solver import run, multistart
 from .topology import (add_kink, spawn_generation, prune, generation_step,
                        generation_ladder, grow_topology)
+from .construct import (build_hierarchy, constructive_ladder, sweep_ratios,
+                        check_insertion_neutral, grid_convergence_check,
+                        travel_sanity, saturation_diagnostics)
+from .melt import (build_band, build_melt_hierarchy, melt_ladder, melt_sweep,
+                   read_environment, env_distance, check_band_neutral,
+                   band_travel_sanity, mesh_cross_check, fixed_point_sweep)
 
 __all__ = [
     "MARGIN", "GAP", "PEN_W", "hat_matrix", "conv_eval",
@@ -76,4 +88,10 @@ __all__ = [
     "run", "multistart",
     "add_kink", "spawn_generation", "prune", "generation_step",
     "generation_ladder", "grow_topology",
+    "build_hierarchy", "constructive_ladder", "sweep_ratios",
+    "check_insertion_neutral", "grid_convergence_check", "travel_sanity",
+    "saturation_diagnostics",
+    "build_band", "build_melt_hierarchy", "melt_ladder", "melt_sweep",
+    "read_environment", "env_distance", "check_band_neutral",
+    "band_travel_sanity", "mesh_cross_check", "fixed_point_sweep",
 ]
