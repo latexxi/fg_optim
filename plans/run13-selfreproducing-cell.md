@@ -457,11 +457,24 @@ Done and gated:
   **tracks** coarse J (`ρ×0.7→0.123`, `ρ×0.4→0.070`, `β0.7→0.086`), all `constraints_ok`.
   Default None = unchanged (regression: run3 `Jc=2.3089`, run5 `2.5153`).
 
-Remaining for Stage C (forks D1–D3, §5A): `E′` read-off (`read_environment` needs a
-cell-compatible band-spec); `ρ/r` rescaling (A2); `2^k` tiling multiply (§5); the
-`E → CELL(E)` fixed-point loop. `env_to_lp` currently uses the D1 arm-only default
-(scalar `min(β)` cap) — revisit against D2 (signed slope) if Stage E's E-sufficiency
-probe fires.
+Remaining for Stage C is now broken into ordered, self-contained implementation
+plans under **`plans/run13/`** (readable cold by a fresh agent — `00-primer.md`
+carries the shared context, then tasks `01`–`05`):
+- `01-read-off.md` — `cell_read_env` (E′ read-off) + `cell_env_distance` (ρ/r-normalized).
+- `02-d1-gate.md` — `check_interior_slope` (D1 arm-only-sufficiency verification).
+- `03-fixed-point-loop.md` — `cell_step`, `fixed_point`, `tiling_gain` (the `E→CELL(E)` loop + `2^k` tiling multiply, `γ=2r`).
+- `04-verdict-and-sweep.md` — `cell_sweep` + the §6 decision rule → the bounded/unbounded verdict.
+- `05-sufficiency-probes.md` — A1 (E-sufficiency) / A2 (ρ/r sensitivity), deferred.
+
+**Fork D3 (ρ/r rescaling) and the read-frame are RESOLVED** — derived in
+`plans/run13/00-primer.md §0.6`: `r` = the frame's per-octave width(=amplitude)
+contraction (unit-frame Lipschitz forces f-amplitude ∝ half-width, so rise budget
+`ρ` carries amplitude units and injects as `ρ/r`); `β` is frame-invariant (no
+rescaling); the verdict ratio is `γ = 2r` (tiling count 2 × per-cell J-scale `r`),
+with `r=1/2` the log-growth knife-edge; E′ is read at `t̂=1/2` (midpoint — `t̂=1` is
+terminal-pinned, `t̂=0` is the injection seam). `r` is a *chosen* frame parameter,
+swept like `λ_w`, not a solved unknown. D1 stays arm-only (task 02 verifies);
+revisit D2 (signed slope) only if task 05's E-sufficiency probe fires.
 
 ---
 
