@@ -550,6 +550,65 @@ answer for the real problem.** The unblocking next step is not in this task set:
 the *physical* `r` from an optimizer-driven contraction (`construct.py`/`melt.py`), or
 construct a rise-limited regime where channel 2 binds so `δ_star` can respond to `r`.
 
+### Rise-binding probe (Stage C follow-up) — both unblocking levers, run
+
+Directly chases the two "unblocking next steps" named just above. New in `cell.py`:
+`rise_binding_report(sol, rise_cap)` (channel-2 activity diagnostic — per rise-cap row
+slack `rho - sum_i A[k,i]*hat(xs;XI[k,i])`, reports `frac_binding`/`min_slack`) and a
+`rho_scale` knob on `flat_env` (shrinks the seed rise budget to force channel 2 to
+bind). Four findings, in order:
+
+1. **Baseline / detector calibration.** At the flat seed `frac_binding≈0.0217`
+   (≈1 row per time node) with `min_slack=0` — the kink apex touching the `1-|x|`
+   envelope. Structural corner, benign; channel 2 inert beyond it, as §15A already said.
+   *Detector caveat:* because the seed `rho` shares the envelope's `1-|x|` **shape**,
+   `frac_binding` pegs at ~0.0217 even deep in binding (only apex rows touch, but that
+   one contact scales global f-amplitude) — so `frac_binding` **understates** activity;
+   the honest signals are `min_slack→0` **and** `δ̂(r)` moving.
+
+2. **Shrinking seed `rho` unlocks r-dependence.** Sweeping
+   `rho_scale ∈ {1,0.5,0.25,0.1} × r ∈ {0.35,0.5,0.65}` (one `cell_solve` each): at
+   `rho_scale=1` δ̂ is flat 0.1757 across r (inert, cap `=(1-|x|)/r` loosens with r); as
+   `rho` shrinks the cap `= rho_scale·(1-|x|)/r` drops below the envelope, binds, and
+   **δ̂ becomes r-dependent, δ̂ ∝ rho_scale/r** (e.g. at `rho_scale=0.25`: δ̂ =
+   0.1255/0.0878/0.0676 for r=0.35/0.5/0.65; ratio 0.0878/0.0351 = 2.50 = the
+   `rho_scale/r` prediction). So δ̂ is **not intrinsically** r-invariant — only inert at
+   the flat operating point.
+
+3. **But the rise-limited regime is transient — RELAX-BACK, universal.** Running the
+   full `fixed_point` loop from a shrunk seed (`rho_scale∈{0.1,0.25}`, r∈{0.5,0.65}):
+   step 0 binds (imposed), **step 1 binding vanishes** (`frac_b→0`, `min_slack` 0→0.6-0.75,
+   `rho_mid` rebounds 0.10→0.85), steps 2-9 converge to the **same** slope-limited fixed
+   point `δ̂*=0.10307, rho_mid=0.6894` — bit-identical to the flat seed, every r.
+   Mechanism confirmed exactly: rise cap → shallow f → residual `ρ'=(1-|x|)+f≈1-|x|`
+   (big, capped f consumed little budget) → next cap loose → slope retakes control. **A
+   single-kink cell cannot sustain rise-limitation — one capped kink refills its own
+   budget.** So the geometric verdict γ=2r is the cell's *honest* answer (channel 2
+   inert at the attractor, not just at the seed), and sustaining rise-binding needs an
+   ansatz that keeps *consuming* the budget — a **band** of kinks (melt.py's `K`-band).
+
+4. **Physical `r` off `construct.py` — no clean sustained rate.** Achieved per-octave
+   amplitude contraction (peak LP f-weight/gen, `n_gen=4`, `scale_t=scale_x=0.5`):
+   `0.400,0.2125,0.1607,0.1534,0.1510`, ratios `0.53,0.76,0.95,0.98`. Only the **first**
+   octave obeys `scale_x` (ratio 0.53 ≈ 0.5, i.e. it sits **at the knife-edge**); beyond
+   gen 1 amplitude **plateaus at ~0.15** (ratio→1, a collapse floor not a contraction
+   rate) while harvest dJk = `0.1065,0.0203,0.0062,~0` collapses (ratio ~0.19-0.30). The
+   split is the Run 11 co-location collapse: deep gens keep weight but harvest nothing
+   (redundant hats at the shared anchor). So construct.py furnishes **no single physical
+   `r`** to plug into γ=2r — first octave ≈0.5, but not self-similar past it, and the
+   harvest-bounded reading is *confounded by the same anchor collapse* (Run 11's caveat,
+   not independent evidence).
+
+**Combined reading (unchanged verdict, sharpened wall).** All three levers — cell fixed
+point, rise probe, construct.py — **agree the knife-edge is r=0.5 and the first octave
+sits on it**, and all three hit the **same wall**: every construction here collapses the
+anchor (co-locates deep generations), so none measures a *sustained, non-collapsing*
+per-octave rate. That is the genuine open frontier, unchanged from Runs 11-12: **a
+hierarchy whose generations keep moving to genuinely new locations instead of
+co-locating.** The one structural lead is finding 3's — a band ansatz (melt.py's
+`K`-kinks) is the candidate that could *both* sustain rise-binding *and* avoid
+co-location; building a band-cell is the next real experiment, not a quick follow-on.
+
 ---
 
 ## 16. One-paragraph summary

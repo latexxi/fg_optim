@@ -19,18 +19,22 @@ gated on design forks D1-D3 in the plan's §5A -- see the TODO in `cell_solve`.
 
 import numpy as np
 
-from .geometry import MARGIN, conv_eval
+from .geometry import MARGIN, conv_eval, hat_matrix
 from .lp import lp_weights_f, lp_weights_g
 from .objective import total_J
 from .verify import certify
 from .construct import _travel_path, XI_OFFSET, ETA_OFFSET
 
 
-def flat_env(n_sample=41):
+def flat_env(n_sample=41, rho_scale=1.0):
     """E_0: the coarsest carrier's residue -- full slope slack (beta==1) and full
-    rise budget (rho == 1-|x|), rise share r=1. Injecting this must be a no-op."""
+    rise budget (rho == 1-|x|), rise share r=1. Injecting this (rho_scale=1) must
+    be a no-op. rho_scale<1 shrinks the residual-rise budget: the rise-binding probe
+    (step 2) uses it to drive channel 2 into a genuinely binding regime and test
+    whether delta_hat then responds to r (physical) or stays r-invariant (geometric)."""
     xs = np.linspace(-1 + MARGIN, 1 - MARGIN, n_sample)
-    return dict(x_hat=xs, beta=np.ones_like(xs), rho=1.0 - np.abs(xs), r=1.0)
+    return dict(x_hat=xs, beta=np.ones_like(xs),
+                rho=rho_scale * (1.0 - np.abs(xs)), r=1.0)
 
 
 def env_to_lp(env, Np1):
@@ -112,6 +116,27 @@ def _flat_gate(coarse_N=8):
     dJ = abs(r["J"] - J_plain)
     return dict(J_plain=J_plain, J_flat=r["J"], Jc_flat=r["Jc"],
                 diff=dJ, ok=dJ < 1e-9)
+
+
+def rise_binding_report(sol, rise_cap, tol=1e-9, family="f"):
+    """Channel-2 activity diagnostic (rise-binding probe, step 1). For every
+    (node k, sample xs) rise-cap row, the slack is rho - sum_i W[k,i]*hat(xs;P[k,i]);
+    a row BINDS when slack<=tol (the LP pushed f right up against the residual-rise
+    budget). Reports the fraction of binding rows and the min slack over all rows.
+      frac_binding == 0  => channel 2 inert -- the current flat-seed regime, where
+                            rho/r only ever loosens the cap and slope alone drives J.
+      frac_binding  > 0  => the rise budget genuinely caps f; delta_hat can now
+                            respond to r (the physical regime we are hunting).
+    Returns dict(frac_binding, min_slack, n_rows)."""
+    if rise_cap is None:
+        return dict(frac_binding=0.0, min_slack=float("inf"), n_rows=0)
+    xs, rho = np.asarray(rise_cap[0], float), np.asarray(rise_cap[1], float)
+    W = sol["A"] if family == "f" else sol["B"]
+    P = sol["XI"] if family == "f" else sol["ETA"]
+    slacks = [rho - hat_matrix(xs, P[k]) @ W[k] for k in range(W.shape[0])]
+    slack = np.concatenate(slacks)
+    return dict(frac_binding=float(np.mean(slack <= tol)),
+                min_slack=float(slack.min()), n_rows=int(slack.size))
 
 
 def cell_read_env(sol, r, n_sample=41, family="f"):
