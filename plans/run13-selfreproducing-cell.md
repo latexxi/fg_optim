@@ -476,6 +476,65 @@ terminal-pinned, `t̂=0` is the injection seam). `r` is a *chosen* frame paramet
 swept like `λ_w`, not a solved unknown. D1 stays arm-only (task 02 verifies);
 revisit D2 (signed slope) only if task 05's E-sufficiency probe fires.
 
+### Run 13 result (Stage C)
+
+Tasks 01–04 (`cell_read_env`, `cell_env_distance`, `check_interior_slope`,
+`cell_step`, `fixed_point`, `tiling_gain`, `cell_sweep`, `_verdict`) are implemented
+in `kink_opt/cell.py` and wired into `python3 -m kink_opt.cell`. Sweep over the
+frame contraction `r ∈ {0.35, 0.45, 0.5, 0.55, 0.65}` (12 fixed-point iterations,
+`tol=1e-4`, `coarse_N=8`, `outer=40`, `sub=8`):
+
+| r    | converged | dist_final | δ̂*    | γ_geom (=2r) | γ_emp (last) | verdict   |
+|------|-----------|------------|--------|--------------|--------------|-----------|
+| 0.35 | True      | 5.97e-05   | 0.1031 | 0.70         | 0.70         | BOUNDED   |
+| 0.45 | True      | 4.64e-05   | 0.1031 | 0.90         | 0.90         | BOUNDED   |
+| 0.50 | True      | 4.18e-05   | 0.1031 | 1.00         | 1.00         | UNBOUNDED |
+| 0.55 | True      | 3.80e-05   | 0.1031 | 1.10         | 1.10         | UNBOUNDED |
+| 0.65 | True      | 3.21e-05   | 0.1031 | 1.30         | 1.30         | UNBOUNDED |
+
+The flat-E no-op gate still prints `ok=True` (`diff=0.00e+00`) before the sweep —
+existing tasks 01–03 are untouched.
+
+Every `r` converges (env-reproduction distance ~1e-4-1e-5, well under `tol`), and
+`γ_emp` tracks `γ_geom` exactly at every `r` (no drift), so the sweep's own internal
+consistency check passes: the verdict moves monotonically with `r`, small `r`
+BOUNDED, large `r` UNBOUNDED, flipping exactly at `r=0.5` (the pinned knife-edge —
+note neither `r=0.45` nor `r=0.5` land inside the nominal `(0.9,1.0)` INCONCLUSIVE
+band; `γ=2r` is deterministic in `r`, so this specific 5-point grid happens to hit
+the boundary values `γ=0.9` and `γ=1.0` exactly rather than straddling them).
+
+**Load-bearing caveat (carried over from task 03, restated here because it changes
+what this table means):** `δ̂*` is bit-identical (≈0.10307) across every `r` tested.
+This is not a coincidence of a well-behaved fixed point — it's because `env_to_lp`'s
+channel-2 rise cap is `ρ/r`, and for every `r` swept here (`r<1`) dividing by `r`
+only *loosens* that cap, so channel 2 (the rise budget) never binds; the entire
+harvest is set by channel 1 (arm-only slope) alone, which converges to its own
+`r`-independent fixed point (`β*≈0.7`ish giving `δ̂*≈0.103`). Consequently:
+
+**The r-sweep verdict above is a GEOMETRIC verdict, not a physical one.** It
+correctly restates the pinned tiling identity `γ=2r` and shows the fixed-point
+machinery (env read-off, distance, iteration, tiling multiply) all work and are
+internally consistent — that part is a real, exercised result. But because `δ̂*`
+does not vary with `r` in this regime, the table cannot by itself tell you which
+`r` is the *actual* physical per-octave contraction of the optimizer's own
+generation sequence, nor whether that physical `r` falls above or below 0.5. In
+other words: **this sweep proves the knife-edge exists and the machinery finds it
+correctly, but does not yet locate which side of the knife-edge the real problem
+sits on.** Pinning that needs either (a) the physical `r` read off an actual
+optimizer-driven contraction (e.g. from `construct.py`/`melt.py`'s hierarchy, not
+chosen by hand), or (b) a regime where channel 2 genuinely binds (a child that is
+rise-limited, not just slope-limited) so `δ̂*` can respond to `r` and the sweep
+tests something beyond geometry alone.
+
+**Task 05 (A1/A2 sufficiency probes) has not been run.** Per its own task file and
+the primer's §0.5, the verdict above is conditional on (A1) `E` being a sufficient
+statistic for the parent's residue and (A2) the `ρ/r` rescaling being the right
+normalization — neither is independently checked yet. Combined with the geometric-
+only caveat above, the honest summary is: **the sweep is internally consistent and
+monotone as designed, but is not yet evidence for where the real problem's
+boundedness question lands** — it is a validated instrument, not yet a pinned
+answer.
+
 ---
 
 ## 16. One-paragraph summary
